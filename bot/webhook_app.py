@@ -1,3 +1,4 @@
+from . import db
 import os
 import logging
 from dotenv import load_dotenv
@@ -22,17 +23,12 @@ def main():
 
     # Burn polling job (unchanged)
     async def burn_job(context: ContextTypes.DEFAULT_TYPE):
-        if not state["subs"]:
-            return
-        events = await sources.get_new_burns(cfg, state)
-        for e in events:
-            amt = e.get("ui_amount")
-            amt_txt = f"{amt:,.4f}" if isinstance(amt, (int, float)) else "?"
-            url = f"https://solscan.io/tx/{e['sig']}"
-            text = f"🔥 RENDER burn: {amt_txt}\n{url}"
-            for chat_id in list(state["subs"]):
-                try:
-                    await context.bot.send_message(chat_id, text)
+events = await sources.get_new_burns(cfg, state)
+subs = db.list_subs()
+if not subs:
+    return
+for chat_id in subs:
+    await context.bot.send_message(chat_id, text)
                 except Exception:
                     logging.exception("send_message failed")
 
