@@ -1,3 +1,4 @@
+from . import db
 import logging
 logging.basicConfig(level=logging.INFO)
 from telegram import Update, ReplyKeyboardMarkup
