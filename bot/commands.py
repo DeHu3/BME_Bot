@@ -1,3 +1,5 @@
+import logging
+logging.basicConfig(level=logging.INFO)
 from telegram import Update, ReplyKeyboardMarkup
 from telegram.ext import ContextTypes
 from .config import Settings
