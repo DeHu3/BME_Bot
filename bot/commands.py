@@ -14,10 +14,18 @@ def _kb(subscribed: bool):
         resize_keyboard=True
     )
 
+import logging
+
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE, cfg: Settings, state: dict):
-    chat_id = update.effective_chat.id
-    subscribed = chat_id in state.get("subs", set())
-    await update.message.reply_text("Render Alerts Bot is alive. Use /help.", reply_markup=_kb(subscribed))
+    # Log that /start was called and by whom
+    chat_id = update.effective_chat.id if update.effective_chat else "Unknown"
+    logging.info("cmd_start called for chat_id=%s", chat_id)
+
+    # Send the start message
+    await update.message.reply_text(
+        "Render Alerts Bot is alive. Use /help."
+    )
+
 
 async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE, cfg: Settings):
     await update.message.reply_text("Enable burn alerts to get notified when RENDER is burned.")
