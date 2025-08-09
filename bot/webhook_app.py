@@ -2,52 +2,52 @@
 import os
 import logging
 from telegram.ext import Application, CommandHandler, MessageHandler, filters
-
 from bot.commands import cmd_start, cmd_help, handle_text
 from bot.config import load_settings
 
 logging.basicConfig(level=logging.INFO)
 log = logging.getLogger("webhook_app")
 
-def build_application():
-    cfg = load_settings()
-
-    # Hard fail if the token is not provided, so we don't keep rebooting silently.
-    token = getattr(cfg, "TELEGRAM_BOT_TOKEN", None)
-    if not token:
-        raise RuntimeError(
-            "Missing TELEGRAM_BOT_TOKEN. Set it in Cloud Run → "
-            "Service → Edit & deploy new revision → Variables & Secrets."
-        )
-
-    app = Application.builder().token(token).build()
-
-    # Handlers
-    app.add_handler(CommandHandler("start", lambda u, c: cmd_start(u, c, cfg, {})))
-    app.add_handler(CommandHandler("help",  lambda u, c: cmd_help(u, c, cfg)))
-    app.add_handler(
-        MessageHandler(filters.TEXT & ~filters.COMMAND, lambda u, c: handle_text(u, c, cfg, {}))
+def build_application(cfg):
+    # Use the builder to register post_init callback
+    application = (
+        Application.builder()
+        .token(cfg.TELEGRAM_BOT_TOKEN)
+        .post_init(_post_init)  # register post_init here
+        .build()
     )
-    return app, cfg
+
+    # handlers
+    application.add_handler(CommandHandler("start", lambda u, c: cmd_start(u, c, cfg, {})))
+    application.add_handler(CommandHandler("help",  lambda u, c: cmd_help(u, c, cfg)))
+    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND,
+                                           lambda u, c: handle_text(u, c, cfg, {})))
+    return application
+
+async def _post_init(app: Application) -> None:
+    # set webhook AFTER the server is up; if it fails, we log but keep serving
+    cfg = load_settings()  # reload settings to access WEBHOOK_URL etc.
+    url  = cfg.WEBHOOK_URL.rstrip("/") + "/" + (cfg.WEBHOOK_PATH or "tg").strip("/")
+    secret = (cfg.TELEGRAM_WEBHOOK_SECRET or "").strip() or None
+    try:
+        await app.bot.set_webhook(url=url, secret_token=secret, drop_pending_updates=True)
+        log.info("Webhook set: %s", url)
+    except Exception:
+        log.exception("set_webhook failed (server still running)")
 
 def main():
-    app, cfg = build_application()
-
+    cfg = load_settings()
+    # Fail fast if no bot token is configured
+    if not cfg.TELEGRAM_BOT_TOKEN:
+        raise RuntimeError("TELEGRAM_BOT_TOKEN missing in configuration")
+    application = build_application(cfg)
     port = int(os.environ.get("PORT", "8080"))
     path = (cfg.WEBHOOK_PATH or "tg").strip("/")
-    url  = cfg.WEBHOOK_URL.rstrip("/") + "/" + path
-    secret = (cfg.TELEGRAM_WEBHOOK_SECRET or "").strip() or None
-
-    log.info("Starting webhook: listen=0.0.0.0:%s path=/%s url=%s", port, path, url)
-
-    # Set the webhook via run_webhook to avoid post_init incompatibilities
-    app.run_webhook(
+    log.info("Binding server on 0.0.0.0:%s path=/%s", port, path)
+    application.run_webhook(
         listen="0.0.0.0",
         port=port,
         url_path=path,
-        webhook_url=url,
-        secret_token=secret,
-        drop_pending_updates=True,
     )
 
 if __name__ == "__main__":
