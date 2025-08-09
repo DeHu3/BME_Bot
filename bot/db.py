@@ -10,7 +10,7 @@ except Exception:
 
 class SubscriberDB:
     def __init__(self):
-        self.db = firestore_async.Client()
+        self.db = AsyncClient()
         # 'subs' collection will hold documents named after list types (e.g. burn_subs, mint_subs)
         self.collection = self.db.collection('subs')
 
