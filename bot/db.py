@@ -14,6 +14,16 @@ class SubscriberDB:
         self.db = AsyncClient()
         # 'subs' collection will hold documents named after list types (e.g. burn_subs, mint_subs)
         self.collection = self.db.collection('subs')
+        self.state = self.db.collection('state')
+
+    async def get_state(self, key: str) -> dict:
+    """Return a small dict used as a cursor/state between cron invocations."""
+    doc = await self.state.document(key).get()
+    return doc.to_dict() or {}
+
+async def save_state(self, key: str, data: dict) -> None:
+    """Persist the state dict."""
+    await self.state.document(key).set(dict(data or {}))
 
     async def get_subs(self, list_name: str) -> set[int]:
         """Fetch subscriber chat IDs for a given list."""
