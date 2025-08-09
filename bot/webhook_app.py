@@ -1,9 +1,53 @@
 # bot/webhook_app.py
+from aiohttp import web
+from bot.db import SubscriberDB
+from bot import sources  # this is the same module you were using in the old job
 import os
 import logging
 from telegram.ext import Application, CommandHandler, MessageHandler, filters
 from bot.commands import cmd_start, cmd_help, handle_text
 from bot.config import load_settings
+
+async def run_burn_once(bot, cfg):
+    """
+    Pull new burns since last run and notify all subscribers of 'burn_subs'.
+    We persist/restore the 'state' (cursor) in Firestore so cron runs are stateless.
+    """
+    db = SubscriberDB()
+
+    # Load last cursor
+    state = await db.get_state("burn")
+
+    # Fetch new burn events (uses your existing sources.get_new_burns API)
+    events = await sources.get_new_burns(cfg, state)
+
+    # Persist updated cursor/state for next run
+    await db.save_state("burn", state)
+
+    # Nothing new? bail fast
+    if not events:
+        return
+
+    subs = await db.get_subs("burn_subs")
+    if not subs:
+        return
+
+    # Prepare a formatter if your sources module provides one
+    def _fmt(ev):
+        try:
+            return sources.format_burn(ev)  # if exists in your sources
+        except Exception:
+            return f"🔥 Burn event:\n{ev}"
+
+    # Send to all subscribers
+    for ev in events:
+        text = _fmt(ev)
+        for chat_id in subs:
+            try:
+                await bot.send_message(chat_id, text, disable_web_page_preview=True)
+            except Exception:
+                logging.getLogger("webhook_app").exception("send burn failed chat_id=%s", chat_id)
+
 
 logging.basicConfig(level=logging.INFO)
 log = logging.getLogger("webhook_app")
@@ -34,6 +78,23 @@ async def _post_init(app: Application) -> None:
         log.info("Webhook set: %s", url)
     except Exception:
         log.exception("set_webhook failed (server still running)")
+            # -- add this under the existing try/except in _post_init --
+    async def cron_burn(request: web.Request):
+        # simple shared-secret check
+        expected = os.environ.get("CRON_SECRET", "")
+        if not expected or request.query.get("secret") != expected:
+            return web.Response(status=401, text="nope")
+
+        try:
+            await run_burn_once(app.bot, cfg)
+            return web.Response(text="ok")
+        except Exception:
+            log.exception("cron burn failed")
+            return web.Response(status=500, text="error")
+
+    # register the cron route (available on the same aiohttp app PTB uses)
+    app.web_app.add_routes([web.get("/cron/burn", cron_burn)])
+
 
 def main():
     cfg = load_settings()
