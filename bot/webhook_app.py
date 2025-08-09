@@ -1,7 +1,7 @@
 # bot/webhook_app.py
 import os
 import logging
-from aiohttp import web  # for registering the cron route
+from aiohttp import web  # for registering the cron route when available
 from telegram.ext import Application, CommandHandler, MessageHandler, filters
 
 from bot.config import load_settings
@@ -31,7 +31,6 @@ async def run_burn_once(bot, cfg):
     # persist updated state for next run
     await db.save_state("burn", state)
 
-    # no new events? done.
     if not events:
         return
 
@@ -41,12 +40,10 @@ async def run_burn_once(bot, cfg):
 
     def _fmt(ev):
         try:
-            # if you implemented a nice formatter in sources
-            return sources.format_burn(ev)
+            return sources.format_burn(ev)  # optional pretty formatter
         except Exception:
             return f"🔥 Burn event:\n{ev}"
 
-    # fan out to subscribers
     for ev in events:
         text = _fmt(ev)
         for chat_id in subs:
@@ -59,7 +56,7 @@ async def run_burn_once(bot, cfg):
 # ---------- post_init ----------
 async def _post_init(app: Application) -> None:
     """
-    Runs after the server starts: set Telegram webhook and attach /cron/burn route.
+    Runs after the server starts: set Telegram webhook and (if supported) attach /cron/burn route.
     """
     cfg = load_settings()
 
@@ -74,35 +71,38 @@ async def _post_init(app: Application) -> None:
     except Exception:
         log.exception("set_webhook failed (server still running)")
 
-    # cron handler (optional shared-secret via ?secret=...)
-    async def cron_burn(request: web.Request):
-        expected = os.environ.get("CRON_SECRET", "")
-        if expected and request.query.get("secret") != expected:
-            return web.Response(status=401, text="unauthorized")
+    # Only register the cron route if this PTB exposes an aiohttp web app
+    web_app = getattr(app, "web_app", None)
+    if web_app:
+        async def cron_burn(request: web.Request):
+            expected = os.environ.get("CRON_SECRET", "")
+            if expected and request.query.get("secret") != expected:
+                return web.Response(status=401, text="unauthorized")
+            try:
+                await run_burn_once(app.bot, cfg)
+                return web.Response(text="ok")
+            except Exception:
+                log.exception("cron burn failed")
+                return web.Response(status=500, text="error")
 
-        try:
-            await run_burn_once(app.bot, cfg)
-            return web.Response(text="ok")
-        except Exception:
-            log.exception("cron burn failed")
-            return web.Response(status=500, text="error")
-
-    # register the cron endpoint on PTB's internal aiohttp app
-    # NOTE: requires PTB 21.x which exposes Application.web_app
-    app.web_app.add_routes([web.get("/cron/burn", cron_burn)])
+        web_app.add_routes([web.get("/cron/burn", cron_burn)])
+        log.info("Registered /cron/burn route")
+    else:
+        # PTB is older; we can run without the cron route for now so the service boots.
+        log.warning("PTB does not expose Application.web_app; skipping /cron/burn route. "
+                    "Upgrade PTB to enable Cloud Scheduler endpoint.")
 
 
 # ---------- application factory ----------
 def build_application(cfg):
     """
     Create the Telegram Application, register handlers and post_init callback.
-    IMPORTANT: register post_init via the builder (not application.post_init.append)
-    to avoid 'NoneType has no attribute append' on some PTB versions.
+    IMPORTANT: register post_init via the builder to avoid NoneType.append errors.
     """
     application = (
         Application.builder()
         .token(cfg.TELEGRAM_BOT_TOKEN)
-        .post_init(_post_init)  # 👈 register here
+        .post_init(_post_init)  # register here (works on PTB 21.x)
         .build()
     )
 
@@ -129,7 +129,6 @@ def main():
     port = int(os.environ.get("PORT", "8080"))
     path = (cfg.WEBHOOK_PATH or "tg").strip("/")
 
-    # PTB spins up an aiohttp web server here (listens on 0.0.0.0:PORT)
     application.run_webhook(
         listen="0.0.0.0",
         port=port,
