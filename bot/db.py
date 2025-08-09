@@ -1,6 +1,12 @@
 # bot/db.py
 
-from google.cloud import firestore_async
+# Firestore async client import (new path first, then fallback for older libs)
+try:
+    from google.cloud import firestore  # modern path
+    AsyncClient = firestore.AsyncClient  # type: ignore[attr-defined]
+except Exception:
+    # Fallback import path if the installed version doesn’t expose firestore.AsyncClient
+    from google.cloud.firestore_v1 import AsyncClient  # type: ignore
 
 class SubscriberDB:
     def __init__(self):
