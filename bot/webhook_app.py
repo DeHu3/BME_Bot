@@ -1,55 +1,52 @@
-from . import db
+# bot/webhook_app.py
 import os
 import logging
-from dotenv import load_dotenv
-from telegram.ext import Application, CommandHandler, MessageHandler, ContextTypes, filters
+from telegram.ext import Application, CommandHandler, MessageHandler, filters
 
+# === Handlers you already have ===
+# If these come from bot/commands.py, import them instead of stubs:
+from .commands import cmd_start, cmd_help, handle_text
 from .config import load_settings
-from . import commands, sources
 
-logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
-load_dotenv()
+logging.basicConfig(level=logging.INFO)
+log = logging.getLogger("webhook_app")
+
+
+def build_application():
+    cfg = load_settings()
+    token = cfg.TELEGRAM_BOT_TOKEN
+
+    application = Application.builder().token(token).build()
+
+    # Register your handlers (reuse what you already wired in main.py before)
+    application.add_handler(CommandHandler("start", lambda u, c: cmd_start(u, c, cfg, {})))
+    application.add_handler(CommandHandler("help", lambda u, c: cmd_help(u, c, cfg)))
+    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND,
+                                           lambda u, c: handle_text(u, c, cfg, {})))
+
+    return application, cfg
+
 
 def main():
-    cfg = load_settings()
-    app = Application.builder().token(cfg.token).build()
-    state = {"subs": set()}  # in-memory subscribers
+    application, cfg = build_application()
 
-    # Handlers (same logic as polling)
-    app.add_handler(CommandHandler("start", lambda u, c: commands.cmd_start(u, c, cfg, state)))
-    app.add_handler(CommandHandler("help",  lambda u, c: commands.cmd_help(u, c, cfg)))
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND,
-                    lambda u, c: commands.handle_text(u, c, cfg, state)))
+    # Cloud Run requires binding to 0.0.0.0 and the env PORT
+    port = int(os.environ.get("PORT", "8080"))
+    path = cfg.WEBHOOK_PATH.strip("/") if cfg.WEBHOOK_PATH else "tg"
+    url  = cfg.WEBHOOK_URL.rstrip("/") + "/" + path
 
-    # Burn polling job (unchanged)
-    async def burn_job(context: ContextTypes.DEFAULT_TYPE):
-events = await sources.get_new_burns(cfg, state)
-subs = db.list_subs()
-if not subs:
-    return
-for chat_id in subs:
-    await context.bot.send_message(chat_id, text)
-                except Exception:
-                    logging.exception("send_message failed")
+    log.info("Starting webhook server on 0.0.0.0:%s path=/%s url=%s", port, path, url)
 
-    app.job_queue.run_repeating(burn_job, interval=30, first=5)
-
-    # --- Webhook server config (Cloud Run-friendly) ---
-    path = os.getenv("WEBHOOK_PATH", "/tg").lstrip("/")
-    secret = os.getenv("TELEGRAM_WEBHOOK_SECRET", "") or None
-    public_url = (os.getenv("WEBHOOK_URL", "").strip() or None)
-    webhook_url = (public_url.rstrip("/") + "/" + path) if public_url else None
-    port = int(os.getenv("PORT", "8080"))
-
-    logging.info("Starting webhook server on 0.0.0.0:%s path=/%s webhook_url=%s", port, path, webhook_url)
-    app.run_webhook(
+    # This starts an aiohttp web server that listens on 0.0.0.0:PORT
+    # and registers the webhook with Telegram.
+    application.run_webhook(
         listen="0.0.0.0",
         port=port,
         url_path=path,
-        webhook_url=webhook_url,         # if set, PTB will call setWebhook for you
-        secret_token=secret,
-        drop_pending_updates=True,
+        webhook_url=url,
+        secret_token=cfg.TELEGRAM_WEBHOOK_SECRET or None,
     )
+
 
 if __name__ == "__main__":
     main()
