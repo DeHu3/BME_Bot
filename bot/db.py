@@ -16,7 +16,7 @@ class SubscriberDB:
         self.collection = self.db.collection('subs')
         self.state = self.db.collection('state')
 
-    async def get_state(self, key: str) -> dict:
+async def get_state(self, key: str) -> dict:
     """Return a small dict used as a cursor/state between cron invocations."""
     doc = await self.state.document(key).get()
     return doc.to_dict() or {}
