@@ -1,7 +1,9 @@
 # bot/webhook_app.py
 import os
 import logging
-from aiohttp import web  # for registering the cron route when available
+
+# We import aiohttp.web lazily inside _post_init so that the module import
+# itself can never crash the process if aiohttp isn't present.
 from telegram.ext import Application, CommandHandler, MessageHandler, filters
 
 from bot.config import load_settings
@@ -18,18 +20,12 @@ log = logging.getLogger("webhook_app")
 async def run_burn_once(bot, cfg):
     """
     Pull new burns since last run and notify all subscribers of 'burn_subs'.
-    State (cursor) is persisted via SubscriberDB so cron runs are stateless.
+    Cursor/state is persisted via SubscriberDB so cron runs are stateless.
     """
     db = SubscriberDB()
-
-    # restore last cursor/state for the burn job
-    state = await db.get_state("burn")
-
-    # fetch new burn events (provided by your bot.sources module)
-    events = await sources.get_new_burns(cfg, state)
-
-    # persist updated state for next run
-    await db.save_state("burn", state)
+    state = await db.get_state("burn")               # restore last cursor
+    events = await sources.get_new_burns(cfg, state) # fetch new events
+    await db.save_state("burn", state)               # persist cursor for next run
 
     if not events:
         return
@@ -40,7 +36,7 @@ async def run_burn_once(bot, cfg):
 
     def _fmt(ev):
         try:
-            return sources.format_burn(ev)  # optional pretty formatter
+            return sources.format_burn(ev)  # pretty if available
         except Exception:
             return f"🔥 Burn event:\n{ev}"
 
@@ -53,69 +49,92 @@ async def run_burn_once(bot, cfg):
                 log.exception("Failed to send burn alert to chat_id=%s", chat_id)
 
 
-# ---------- post_init ----------
+# ---------- post_init (runs after server binds) ----------
 async def _post_init(app: Application) -> None:
     """
-    Runs after the server starts: set Telegram webhook and (if supported) attach /cron/burn route.
+    Set Telegram webhook and (when supported) attach /cron/burn route
+    to the PTB aiohttp application. MUST NEVER raise.
     """
-    cfg = load_settings()
-
-    # webhook target
-    url = cfg.WEBHOOK_URL.rstrip("/") + "/" + (cfg.WEBHOOK_PATH or "tg").strip("/")
-    secret = (cfg.TELEGRAM_WEBHOOK_SECRET or "").strip() or None
-
-    # set Telegram webhook
     try:
-        await app.bot.set_webhook(url=url, secret_token=secret, drop_pending_updates=True)
-        log.info("Webhook set: %s", url)
-    except Exception:
-        log.exception("set_webhook failed (server still running)")
+        cfg = load_settings()
 
-    # Only register the cron route if this PTB exposes an aiohttp web app
-    web_app = getattr(app, "web_app", None)
-    if web_app:
-        async def cron_burn(request: web.Request):
-            expected = os.environ.get("CRON_SECRET", "")
-            if expected and request.query.get("secret") != expected:
-                return web.Response(status=401, text="unauthorized")
+        # 1) Set Telegram webhook (safe to skip if you prefer manual setup)
+        url = cfg.WEBHOOK_URL.rstrip("/") + "/" + (cfg.WEBHOOK_PATH or "tg").strip("/")
+        secret = (cfg.TELEGRAM_WEBHOOK_SECRET or "").strip() or None
+        try:
+            await app.bot.set_webhook(url=url, secret_token=secret, drop_pending_updates=True)
+            log.info("Webhook set: %s", url)
+        except Exception:
+            log.exception("set_webhook failed (server will continue to run)")
+
+        # 2) If PTB exposes an aiohttp app, register / and /cron/burn routes
+        web_app = getattr(app, "web_app", None)
+        if web_app:
             try:
-                await run_burn_once(app.bot, cfg)
-                return web.Response(text="ok")
-            except Exception:
-                log.exception("cron burn failed")
-                return web.Response(status=500, text="error")
+                from aiohttp import web
 
-        web_app.add_routes([web.get("/cron/burn", cron_burn)])
-        log.info("Registered /cron/burn route")
-    else:
-        # PTB is older; we can run without the cron route for now so the service boots.
-        log.warning("PTB does not expose Application.web_app; skipping /cron/burn route. "
-                    "Upgrade PTB to enable Cloud Scheduler endpoint.")
+                async def health(_request: "web.Request"):
+                    return web.Response(text="ok")
+
+                async def cron_burn(request: "web.Request"):
+                    expected = os.environ.get("CRON_SECRET", "")
+                    if expected and request.query.get("secret") != expected:
+                        return web.Response(status=401, text="unauthorized")
+                    try:
+                        await run_burn_once(app.bot, cfg)
+                        return web.Response(text="ok")
+                    except Exception:
+                        log.exception("cron burn failed")
+                        return web.Response(status=500, text="error")
+
+                web_app.add_routes([
+                    web.get("/", health),               # quick readiness probe
+                    web.get("/cron/burn", cron_burn),   # scheduler target
+                ])
+                log.info("Registered / and /cron/burn routes")
+            except Exception:
+                # Never let route registration kill the process
+                log.exception("Failed to register aiohttp routes; continuing")
+        else:
+            # Still fine; the bot will serve updates, just no /cron/burn endpoint.
+            log.warning("PTB Application.web_app not available; skipping route registration")
+
+    except Exception:
+        # Last‑chance guard: post_init must NEVER bubble an exception.
+        log.exception("post_init crashed; ignoring so container can start")
 
 
 # ---------- application factory ----------
 def build_application(cfg):
     """
-    Create the Telegram Application, register handlers and post_init callback.
-    IMPORTANT: register post_init via the builder to avoid NoneType.append errors.
+    Build the PTB Application and register handlers.
+    Works on PTB 20.x (no builder.post_init) and PTB 21.x+ (has builder.post_init).
     """
-    application = (
-        Application.builder()
-        .token(cfg.TELEGRAM_BOT_TOKEN)
-        .post_init(_post_init)  # register here (works on PTB 21.x)
-        .build()
-    )
+    builder = Application.builder().token(cfg.TELEGRAM_BOT_TOKEN)
 
-    # command handlers
-    application.add_handler(CommandHandler("start", lambda u, c: cmd_start(u, c, cfg, {})))
-    application.add_handler(CommandHandler("help",  lambda u, c: cmd_help(u, c, cfg)))
+    # Build with maximum compatibility:
+    app = None
+    try:
+        # PTB ≥ 21.x supports .post_init() on the builder
+        app = builder.post_init(_post_init).build()
+    except Exception:
+        # Older PTB: build first, then attach if the list is present
+        app = builder.build()
+        try:
+            hook = getattr(app, "post_init", None)
+            if hook and hasattr(hook, "append"):
+                hook.append(_post_init)
+            else:
+                log.warning("PTB post_init hook not available; skipping webhook auto-setup")
+        except Exception:
+            log.exception("Could not attach post_init; continuing")
 
-    # text handler
-    application.add_handler(
-        MessageHandler(filters.TEXT & ~filters.COMMAND, lambda u, c: handle_text(u, c, cfg, {}))
-    )
-
-    return application
+    # Handlers
+    app.add_handler(CommandHandler("start", lambda u, c: cmd_start(u, c, cfg, {})))
+    app.add_handler(CommandHandler("help",  lambda u, c: cmd_help(u, c, cfg)))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND,
+                                   lambda u, c: handle_text(u, c, cfg, {})))
+    return app
 
 
 # ---------- entrypoint ----------
@@ -125,10 +144,10 @@ def main():
         raise RuntimeError("TELEGRAM_BOT_TOKEN missing in configuration")
 
     application = build_application(cfg)
-
     port = int(os.environ.get("PORT", "8080"))
     path = (cfg.WEBHOOK_PATH or "tg").strip("/")
 
+    # Bind server. This returns only when the process is stopping.
     application.run_webhook(
         listen="0.0.0.0",
         port=port,
