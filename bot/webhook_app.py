@@ -37,7 +37,7 @@ def main():
         except Exception:
             log.exception("set_webhook failed (server still running)")
 
-    application.post_init.append(_post_init)
+application.post_init = _post_init
 
     log.info("Binding server on 0.0.0.0:%s path=/%s", port, path)
     application.run_webhook(
