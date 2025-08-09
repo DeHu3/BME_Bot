@@ -2,8 +2,8 @@
 import os
 import logging
 from telegram.ext import Application, CommandHandler, MessageHandler, filters
-from .commands import cmd_start, cmd_help, handle_text
-from .config import load_settings
+from bot.commands import cmd_start, cmd_help, handle_text
+from bot.config import load_settings
 
 logging.basicConfig(level=logging.INFO)
 log = logging.getLogger("webhook_app")
