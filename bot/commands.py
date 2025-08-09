@@ -34,12 +34,12 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE, cfg: S
     chat_id = update.effective_chat.id
 
     if text == BTN_ENABLE:
-        db.sub_on(chat_id)
+        db.sub_on("burn_subs", chat_id)
         logging.info("alerts ON for chat_id=%s", chat_id)
         await update.message.reply_text("Burn alerts enabled for this chat.", reply_markup=_kb(True))
 
     elif text == BTN_DISABLE:
-        db.sub_off(chat_id)
+        db.sub_off("burn_subs", chat_id)
         logging.info("alerts OFF for chat_id=%s", chat_id)
         await update.message.reply_text("Burn alerts disabled for this chat.", reply_markup=_kb(False))
 
