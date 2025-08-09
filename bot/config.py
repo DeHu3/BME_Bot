@@ -1,19 +1,24 @@
-import os
-from dataclasses import dataclass
+# bot/config.py
+from pydantic import BaseSettings
 
-@dataclass
-class Settings:
-    token: str
-    helius_base: str
-    helius_key: str
-    render_mint: str = "rndrizKT3MK1iimdxRdWabcF7Zg7AR5T4nud4EkHBof"
+
+class Settings(BaseSettings):
+    # Telegram
+    TELEGRAM_BOT_TOKEN: str                       # <-- REQUIRED
+    TELEGRAM_WEBHOOK_SECRET: str | None = None    # optional
+
+    # Webhook
+    WEBHOOK_URL: str                              # e.g. https://bme-bot-xxxxxx.run.app
+    WEBHOOK_PATH: str = "tg"                      # default path
+
+    # Others you already use
+    HELIUS_API_KEY: str | None = None
+    HELIUS_BASE: str = "https://mainnet.helius-rpc.com"
+
+    class Config:
+        env_file = ".env"         # allows local runs to read .env
+        case_sensitive = True     # EXACT name match required
+
 
 def load_settings() -> Settings:
-    token = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
-    if not token:
-        raise RuntimeError("TELEGRAM_BOT_TOKEN missing in .env")
-    base = os.getenv("HELIUS_BASE", "https://mainnet.helius-rpc.com").strip()
-    key = os.getenv("HELIUS_API_KEY", "").strip()
-    if not key:
-        raise RuntimeError("HELIUS_API_KEY missing in .env")
-    return Settings(token=token, helius_base=base, helius_key=key)
+    return Settings()
