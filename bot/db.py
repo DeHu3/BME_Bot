@@ -9,7 +9,8 @@ except Exception:
     from google.cloud.firestore_v1 import AsyncClient  # type: ignore
 
 class SubscriberDB:
-    def __init__(self):
+    def __init__(self) -> None:
+        # Init Firestore client for async usage
         self.db = AsyncClient()
         # 'subs' collection will hold documents named after list types (e.g. burn_subs, mint_subs)
         self.collection = self.db.collection('subs')
