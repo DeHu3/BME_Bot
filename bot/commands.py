@@ -20,7 +20,7 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE, cfg: Set
     chat_id = update.effective_chat.id if update.effective_chat else "Unknown"
     logging.info("cmd_start called for chat_id=%s", chat_id)
 
-    subscribed = db.is_sub(update.effective_chat.id)
+    subscribed = db.is_sub("burn_subs", update.effective_chat.id)
     await update.message.reply_text(
         "Render Alerts Bot is alive. Use /help.",
         reply_markup=_kb(subscribed)
