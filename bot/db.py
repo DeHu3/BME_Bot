@@ -1,104 +1,81 @@
 # bot/db.py
 from __future__ import annotations
 
+from typing import Optional, List, Dict
 import asyncpg
-from typing import Any, Optional, Sequence
 
 
 class SubscriberDB:
-    """
-    Very small helper around asyncpg.
-    Tables:
-      - subscribers(chat_id BIGINT PRIMARY KEY, tags TEXT[] NOT NULL DEFAULT '{}'::TEXT[])
-      - kv_state(k TEXT PRIMARY KEY, v JSONB NOT NULL)
-    """
-
-    def __init__(self, dsn: str) -> None:
+    def __init__(self, dsn: str):
         self._dsn = dsn
         self._pool: Optional[asyncpg.Pool] = None
 
-    async def _pool(self) -> asyncpg.Pool:
+    async def pool(self) -> asyncpg.Pool:
+        """Lazily create/get an asyncpg pool."""
         if self._pool is None:
-            self._pool = await asyncpg.create_pool(self._dsn, min_size=1, max_size=5)
+            self._pool = await asyncpg.create_pool(self._dsn, min_size=1, max_size=4)
         return self._pool
 
     async def ensure_schema(self) -> None:
-        pool = await self._pool()
+        pool = await self.pool()
+        async with pool.acquire() as con:
+            # subscriber groups (topic + chat_id)
+            await con.execute("""
+            CREATE TABLE IF NOT EXISTS subscriptions(
+                topic   TEXT   NOT NULL,
+                chat_id BIGINT NOT NULL,
+                PRIMARY KEY (topic, chat_id)
+            );
+            """)
+            # simple KV state storage (cursor/counters, etc.)
+            await con.execute("""
+            CREATE TABLE IF NOT EXISTS kv_state(
+                key   TEXT  PRIMARY KEY,
+                value JSONB NOT NULL
+            );
+            """)
+
+    # ----- subscriptions -----
+
+    async def add_sub(self, topic: str, chat_id: int) -> None:
+        pool = await self.pool()
         async with pool.acquire() as con:
             await con.execute(
-                """
-                CREATE TABLE IF NOT EXISTS subscribers (
-                    chat_id BIGINT PRIMARY KEY,
-                    tags TEXT[] NOT NULL DEFAULT '{}'::TEXT[]
-                );
-
-                CREATE TABLE IF NOT EXISTS kv_state (
-                    k TEXT PRIMARY KEY,
-                    v JSONB NOT NULL
-                );
-                """
+                "INSERT INTO subscriptions(topic, chat_id) VALUES($1, $2) "
+                "ON CONFLICT DO NOTHING;",
+                topic, chat_id
             )
 
-    # ---------- subscriptions ----------
-
-    async def add_sub(self, chat_id: int, tag: str) -> None:
-        pool = await self._pool()
+    async def remove_sub(self, topic: str, chat_id: int) -> None:
+        pool = await self.pool()
         async with pool.acquire() as con:
             await con.execute(
-                """
-                INSERT INTO subscribers (chat_id, tags)
-                VALUES ($1, ARRAY[$2]::TEXT[])
-                ON CONFLICT (chat_id) DO UPDATE
-                SET tags = (
-                    SELECT ARRAY(SELECT DISTINCT e
-                                 FROM unnest(subscribers.tags || EXCLUDED.tags) AS e)
-                );
-                """,
-                chat_id,
-                tag,
+                "DELETE FROM subscriptions WHERE topic=$1 AND chat_id=$2;",
+                topic, chat_id
             )
 
-    async def del_sub(self, chat_id: int, tag: str) -> None:
-        pool = await self._pool()
+    async def get_subs(self, topic: str) -> List[int]:
+        pool = await self.pool()
         async with pool.acquire() as con:
-            await con.execute(
-                """
-                UPDATE subscribers
-                SET tags = ARRAY(
-                    SELECT e FROM unnest(tags) AS e WHERE e <> $2
-                )
-                WHERE chat_id = $1;
-                """,
-                chat_id,
-                tag,
-            )
-
-    async def get_subs(self, tag: str) -> list[int]:
-        pool = await self._pool()
-        async with pool.acquire() as con:
-            rows: Sequence[asyncpg.Record] = await con.fetch(
-                "SELECT chat_id FROM subscribers WHERE $1 = ANY(tags);",
-                tag,
+            rows = await con.fetch(
+                "SELECT chat_id FROM subscriptions WHERE topic=$1;",
+                topic
             )
         return [r["chat_id"] for r in rows]
 
-    # ---------- state cursor ----------
+    # ----- state -----
 
-    async def get_state(self, key: str) -> dict[str, Any]:
-        pool = await self._pool()
+    async def get_state(self, key: str) -> Dict:
+        pool = await self.pool()
         async with pool.acquire() as con:
-            row = await con.fetchrow("SELECT v FROM kv_state WHERE k = $1;", key)
-        return dict(row["v"]) if row else {}
+            row = await con.fetchrow("SELECT value FROM kv_state WHERE key=$1;", key)
+        return {} if row is None else row["value"]
 
-    async def save_state(self, key: str, value: dict[str, Any]) -> None:
-        pool = await self._pool()
+    async def save_state(self, key: str, value: Dict) -> None:
+        pool = await self.pool()
         async with pool.acquire() as con:
             await con.execute(
-                """
-                INSERT INTO kv_state(k, v)
-                VALUES ($1, $2::jsonb)
-                ON CONFLICT (k) DO UPDATE SET v = EXCLUDED.v;
-                """,
-                key,
-                value,
+                "INSERT INTO kv_state(key, value) VALUES($1, $2) "
+                "ON CONFLICT (key) DO UPDATE SET value=EXCLUDED.value;",
+                key, value
             )
