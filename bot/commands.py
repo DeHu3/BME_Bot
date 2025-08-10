@@ -1,55 +1,31 @@
 # bot/commands.py
-from __future__ import annotations
-
-from functools import partial
-
 from telegram import Update
 from telegram.ext import ContextTypes
-from bot.db import SubscriberDB
 
 
-# tag constants
-BURN_TAG = "burns"
-
-
-async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE, *, db: SubscriberDB) -> None:
-    """Subscribe the user to burn alerts by default."""
-    chat = update.effective_chat
-    await db.ensure_schema()
-    await db.add_sub(chat.id, BURN_TAG)
-    await update.message.reply_text(
-        "👋 Hey! You’re now subscribed to 🔥 burn alerts.\n\n"
-        "Commands:\n"
-        "• /subscribe – subscribe to burn alerts\n"
-        "• /unsubscribe – stop burn alerts\n"
-        "• /help – help\n"
+async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Subscribe the chat to burn alerts."""
+    db = context.application.bot_data["db"]
+    chat_id = update.effective_chat.id
+    await db.add_sub("burn_subs", chat_id)
+    await context.bot.send_message(
+        chat_id,
+        "✅ Subscribed to burn alerts.\nSend 'stop' to unsubscribe, or /help for help."
     )
 
 
-async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE, *, db: SubscriberDB) -> None:
-    await update.message.reply_text(
-        "This bot sends 🔥 burn alerts.\n"
-        "Use /subscribe to receive them, /unsubscribe to stop."
+async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await context.bot.send_message(
+        update.effective_chat.id,
+        "Commands:\n/start – subscribe to burn alerts\n/help – this help\n"
+        "Send 'stop' to unsubscribe."
     )
 
 
-async def cmd_subscribe(update: Update, context: ContextTypes.DEFAULT_TYPE, *, db: SubscriberDB) -> None:
-    chat = update.effective_chat
-    await db.add_sub(chat.id, BURN_TAG)
-    await update.message.reply_text("✅ Subscribed to 🔥 burn alerts.")
-
-
-async def cmd_unsubscribe(update: Update, context: ContextTypes.DEFAULT_TYPE, *, db: SubscriberDB) -> None:
-    chat = update.effective_chat
-    await db.del_sub(chat.id, BURN_TAG)
-    await update.message.reply_text("🛑 Unsubscribed from 🔥 burn alerts.")
-
-
-async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE, *, db: SubscriberDB) -> None:
-    # Keep this as a passthrough in case you want text behaviors later.
-    return  # no-op for now
-
-
-# helpers to bind handlers in webhook_app
-def bind(fn, *, db: SubscriberDB):
-    return partial(fn, db=db)
+async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    text = (update.message.text or "").strip().lower()
+    db = context.application.bot_data["db"]
+    chat_id = update.effective_chat.id
+    if text in {"stop", "unsubscribe", "unsub"}:
+        await db.remove_sub("burn_subs", chat_id)
+        await context.bot.send_message(chat_id, "🛑 Unsubscribed. Send /start to subscribe again.")
