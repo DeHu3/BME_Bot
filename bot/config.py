@@ -1,27 +1,40 @@
 # bot/config.py
-from functools import lru_cache
-from pydantic import BaseSettings
+import os
+from typing import Optional
+
+from pydantic import Field
+from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
 class Settings(BaseSettings):
-    TELEGRAM_BOT_TOKEN: str
+    # --- required ---
+    TELEGRAM_BOT_TOKEN: str = Field(..., description="Telegram bot token")
+    DATABASE_URL: str = Field(..., description="SQLAlchemy / asyncpg URL")
 
-    # Optional — if omitted we’ll use RENDER_EXTERNAL_URL
-    WEBHOOK_URL: str | None = None
-    WEBHOOK_PATH: str = "tg"
-    TELEGRAM_WEBHOOK_SECRET: str | None = None
+    # --- optional / defaults ---
+    WEBHOOK_URL: Optional[str] = Field(
+        default=None, description="Public base URL; if None we use RENDER_EXTERNAL_URL"
+    )
+    WEBHOOK_PATH: str = Field(default="tg", description="Webhook path segment")
+    TELEGRAM_WEBHOOK_SECRET: Optional[str] = Field(
+        default=None, description="Secret token for Telegram webhook verification"
+    )
+    CRON_SECRET: Optional[str] = Field(
+        default=None, description="Shared secret for /cron/burn endpoint"
+    )
 
-    # Render Postgres connection string. Use the **Internal Database URL**.
-    DATABASE_URL: str
-
-    # Shared secret for the /cron/burn endpoint
-    CRON_SECRET: str | None = None
-
-    class Config:
-        env_file = ".env"
-        case_sensitive = False
+    # pydantic v2 config
+    model_config = SettingsConfigDict(env_file=".env", extra="ignore")
 
 
-@lru_cache()
 def load_settings() -> Settings:
-    return Settings()
+    s = Settings()
+
+    # If WEBHOOK_URL not provided, prefer Render’s provided public URL
+    if not s.WEBHOOK_URL:
+        render_url = os.getenv("RENDER_EXTERNAL_URL")
+        if render_url:
+            # RENDER_EXTERNAL_URL is like: https://your-service.onrender.com
+            s.WEBHOOK_URL = render_url.rstrip("/")
+
+    return s
