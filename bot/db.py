@@ -1,65 +1,104 @@
 # bot/db.py
-import os
+from __future__ import annotations
+
 import asyncpg
-from typing import Set, Optional
+from typing import Any, Optional, Sequence
+
 
 class SubscriberDB:
-    def __init__(self):
-        self._pool: Optional[asyncpg.pool.Pool] = None
+    """
+    Very small helper around asyncpg.
+    Tables:
+      - subscribers(chat_id BIGINT PRIMARY KEY, tags TEXT[] NOT NULL DEFAULT '{}'::TEXT[])
+      - kv_state(k TEXT PRIMARY KEY, v JSONB NOT NULL)
+    """
 
-    async def connect(self):
+    def __init__(self, dsn: str) -> None:
+        self._dsn = dsn
+        self._pool: Optional[asyncpg.Pool] = None
+
+    async def _pool(self) -> asyncpg.Pool:
         if self._pool is None:
-            # Use a single connection pool for performance; DB_URL must be provided via env
-            self._pool = await asyncpg.create_pool(os.environ["DATABASE_URL"])
+            self._pool = await asyncpg.create_pool(self._dsn, min_size=1, max_size=5)
+        return self._pool
 
-            # Create tables if they don’t exist
-            async with self._pool.acquire() as conn:
-                await conn.execute("""
-                    CREATE TABLE IF NOT EXISTS subscriber_lists (
-                        list_name TEXT PRIMARY KEY,
-                        subs      BIGINT[] NOT NULL
-                    );
-                    CREATE TABLE IF NOT EXISTS bot_state (
-                        key   TEXT PRIMARY KEY,
-                        value JSONB
-                    );
-                """)
+    async def ensure_schema(self) -> None:
+        pool = await self._pool()
+        async with pool.acquire() as con:
+            await con.execute(
+                """
+                CREATE TABLE IF NOT EXISTS subscribers (
+                    chat_id BIGINT PRIMARY KEY,
+                    tags TEXT[] NOT NULL DEFAULT '{}'::TEXT[]
+                );
 
-    async def close(self):
-        if self._pool is not None:
-            await self._pool.close()
-
-    async def get_subs(self, list_name: str) -> Set[int]:
-        await self.connect()
-        async with self._pool.acquire() as conn:
-            row = await conn.fetchrow(
-                "SELECT subs FROM subscriber_lists WHERE list_name=$1", list_name
+                CREATE TABLE IF NOT EXISTS kv_state (
+                    k TEXT PRIMARY KEY,
+                    v JSONB NOT NULL
+                );
+                """
             )
-            return set(row["subs"]) if row else set()
 
-    async def save_subs(self, list_name: str, subs: Set[int]) -> None:
-        await self.connect()
-        async with self._pool.acquire() as conn:
-            await conn.execute("""
-                INSERT INTO subscriber_lists (list_name, subs)
-                VALUES ($1, $2)
-                ON CONFLICT (list_name)
-                DO UPDATE SET subs = EXCLUDED.subs
-            """, list_name, list(subs))
+    # ---------- subscriptions ----------
 
-    async def get_state(self, key: str):
-        """Retrieve JSON state for burn cursor or other state."""
-        await self.connect()
-        async with self._pool.acquire() as conn:
-            row = await conn.fetchrow("SELECT value FROM bot_state WHERE key=$1", key)
-            return row["value"] if row else {}
+    async def add_sub(self, chat_id: int, tag: str) -> None:
+        pool = await self._pool()
+        async with pool.acquire() as con:
+            await con.execute(
+                """
+                INSERT INTO subscribers (chat_id, tags)
+                VALUES ($1, ARRAY[$2]::TEXT[])
+                ON CONFLICT (chat_id) DO UPDATE
+                SET tags = (
+                    SELECT ARRAY(SELECT DISTINCT e
+                                 FROM unnest(subscribers.tags || EXCLUDED.tags) AS e)
+                );
+                """,
+                chat_id,
+                tag,
+            )
 
-    async def save_state(self, key: str, value):
-        """Persist JSON state."""
-        await self.connect()
-        async with self._pool.acquire() as conn:
-            await conn.execute("""
-                INSERT INTO bot_state (key, value)
+    async def del_sub(self, chat_id: int, tag: str) -> None:
+        pool = await self._pool()
+        async with pool.acquire() as con:
+            await con.execute(
+                """
+                UPDATE subscribers
+                SET tags = ARRAY(
+                    SELECT e FROM unnest(tags) AS e WHERE e <> $2
+                )
+                WHERE chat_id = $1;
+                """,
+                chat_id,
+                tag,
+            )
+
+    async def get_subs(self, tag: str) -> list[int]:
+        pool = await self._pool()
+        async with pool.acquire() as con:
+            rows: Sequence[asyncpg.Record] = await con.fetch(
+                "SELECT chat_id FROM subscribers WHERE $1 = ANY(tags);",
+                tag,
+            )
+        return [r["chat_id"] for r in rows]
+
+    # ---------- state cursor ----------
+
+    async def get_state(self, key: str) -> dict[str, Any]:
+        pool = await self._pool()
+        async with pool.acquire() as con:
+            row = await con.fetchrow("SELECT v FROM kv_state WHERE k = $1;", key)
+        return dict(row["v"]) if row else {}
+
+    async def save_state(self, key: str, value: dict[str, Any]) -> None:
+        pool = await self._pool()
+        async with pool.acquire() as con:
+            await con.execute(
+                """
+                INSERT INTO kv_state(k, v)
                 VALUES ($1, $2::jsonb)
-                ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value
-            """, key, value)
+                ON CONFLICT (k) DO UPDATE SET v = EXCLUDED.v;
+                """,
+                key,
+                value,
+            )
