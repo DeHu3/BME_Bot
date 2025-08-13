@@ -12,17 +12,13 @@ from bot.commands import cmd_start, cmd_help, handle_text
 logging.basicConfig(level=logging.INFO)
 log = logging.getLogger("webhook_app")
 
-# ---- burn runner used by cron_worker too ----
-async def run_burn_once(bot, cfg):
-    """
-    Pull new burns since last run and notify burn subscribers.
-    Expects bot.send_message to be available (PTB Bot).
-    """
-    from bot import sources  # your existing module for Helius fetch & formatting
 
+# Reused by cron worker
+async def run_burn_once(bot, cfg):
+    from bot import sources
     db = SubscriberDB(cfg.DATABASE_URL)
     state = await db.get_state("burn")
-    events = await sources.get_new_burns(cfg, state)  # must update 'state' internally
+    events = await sources.get_new_burns(cfg, state)
     await db.save_state("burn", state)
 
     if not events:
@@ -46,31 +42,13 @@ async def run_burn_once(bot, cfg):
             except Exception:
                 log.exception("send burn failed chat_id=%s", chat_id)
 
-# ---- PTB app (webhook) ----
-async def _post_init(app: Application) -> None:
-    cfg = load_settings()
 
-    # Ensure DB schema exists at startup
+async def _post_init(app: Application) -> None:
+    """Only ensure DB schema here. We set webhook in run_webhook below."""
+    cfg = load_settings()
     db = SubscriberDB(cfg.DATABASE_URL)
     await db.ensure_schema()
 
-    # Set Telegram webhook
-    base = (cfg.WEBHOOK_URL or "").rstrip("/")
-    if not base:
-        # Render should set RENDER_EXTERNAL_URL; load_settings() tries to fill WEBHOOK_URL from it.
-        # If still empty, log and skip. You can still set it manually via env later.
-        log.error("WEBHOOK_URL missing and RENDER_EXTERNAL_URL not found; webhook not set.")
-        return
-
-    path = (cfg.WEBHOOK_PATH or "tg").strip("/")
-    url = f"{base}/{path}"
-    secret = (cfg.TELEGRAM_WEBHOOK_SECRET or "").strip() or None
-
-    try:
-        await app.bot.set_webhook(url=url, secret_token=secret, drop_pending_updates=True)
-        log.info("Webhook set: %s", url)
-    except Exception:
-        log.exception("set_webhook failed")
 
 def build_application(cfg):
     application = (
@@ -79,21 +57,45 @@ def build_application(cfg):
         .post_init(_post_init)
         .build()
     )
-    # handlers
     application.add_handler(CommandHandler("start", lambda u, c: cmd_start(u, c, cfg, {})))
     application.add_handler(CommandHandler("help",  lambda u, c: cmd_help(u, c, cfg)))
-    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, lambda u, c: handle_text(u, c, cfg, {})))
+    application.add_handler(
+        MessageHandler(filters.TEXT & ~filters.COMMAND, lambda u, c: handle_text(u, c, cfg, {}))
+    )
     return application
+
 
 def main():
     cfg = load_settings()
     if not cfg.TELEGRAM_BOT_TOKEN:
         raise RuntimeError("TELEGRAM_BOT_TOKEN missing")
-    application = build_application(cfg)
-    port = int(os.environ.get("PORT", "10000"))
+
+    # Build the full HTTPS webhook URL explicitly
+    base = (cfg.WEBHOOK_URL or os.getenv("RENDER_EXTERNAL_URL") or "").rstrip("/")
     path = (cfg.WEBHOOK_PATH or "tg").strip("/")
+    if not base or not base.startswith("https://"):
+        raise RuntimeError(
+            "WEBHOOK_URL is missing or not https. "
+            "Set WEBHOOK_URL to your Render service URL, e.g. https://<name>.onrender.com"
+        )
+    full_url = f"{base}/{path}"
+    secret = (cfg.TELEGRAM_WEBHOOK_SECRET or "").strip() or None
+
+    application = build_application(cfg)
+
+    port = int(os.environ.get("PORT", "10000"))
     log.info("Binding server on 0.0.0.0:%s path=/%s", port, path)
-    application.run_webhook(listen="0.0.0.0", port=port, url_path=path)
+    log.info("Using webhook_url=%s", full_url)
+
+    # Pass webhook_url explicitly so PTB sets it correctly (https)
+    application.run_webhook(
+        listen="0.0.0.0",
+        port=port,
+        url_path=path,
+        webhook_url=full_url,
+        secret_token=secret,
+    )
+
 
 if __name__ == "__main__":
     main()
