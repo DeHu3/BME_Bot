@@ -20,7 +20,7 @@ async def run_burn_once(bot, cfg):
     from bot import sources  # your burn fetch/format module
 
     db = SubscriberDB(cfg.DATABASE_URL)
-    await db.ensure_schema()  # safe to call; no-op after first time
+    await db.ensure_schema()  # idempotent
 
     state = await db.get_state("burn")
     events = await sources.get_new_burns(cfg, state)  # must mutate 'state' if you use cursors
@@ -49,7 +49,7 @@ async def run_burn_once(bot, cfg):
 
 
 # -------- aiohttp + PTB webhook server with health route --------
-async def _build_ptb_app(cfg) -> Application:
+async def _build_ptb_app(cfg):
     app = Application.builder().token(cfg.TELEGRAM_BOT_TOKEN).build()
     app.add_handler(CommandHandler("start", lambda u, c: cmd_start(u, c, cfg, {})))
     app.add_handler(CommandHandler("help",  lambda u, c: cmd_help(u, c, cfg)))
@@ -61,63 +61,55 @@ async def _build_ptb_app(cfg) -> Application:
 async def amain():
     cfg = load_settings()
 
-    # Ensure DB schema early
+    # Ensure DB schema early (safe & idempotent)
     db = SubscriberDB(cfg.DATABASE_URL)
     await db.ensure_schema()
 
-    # Build PTB app
+    # Build PTB app now
     ptb_app = await _build_ptb_app(cfg)
 
-    # Build & validate HTTPS webhook URL
-    base = (cfg.WEBHOOK_URL or os.getenv("RENDER_EXTERNAL_URL") or "").rstrip("/")
+    # Prepare webhook route (doesn't require Telegram set yet)
     path = (cfg.WEBHOOK_PATH or "tg").strip("/")
-    if not base.startswith("https://"):
-        raise RuntimeError(
-            "WEBHOOK_URL missing or not https. Set WEBHOOK_URL to your Render URL, e.g. https://<name>.onrender.com"
-        )
-    full_url = f"{base}/{path}"
     secret = (cfg.TELEGRAM_WEBHOOK_SECRET or "").strip() or None
 
-    # Set Telegram webhook explicitly (https)
-    await ptb_app.bot.set_webhook(url=full_url, secret_token=secret, drop_pending_updates=True)
-    log.info("Using webhook_url=%s", full_url)
-
-    # --- Build aiohttp server that serves both the webhook and health checks ---
-    # Prefer built-in helper if available (PTB >= 20.4), else fall back to manual route.
-    aio: web.Application
+    # Prefer PTB helper if available
     if hasattr(ptb_app, "get_webhook_app"):
         aio = ptb_app.get_webhook_app(path=f"/{path}", secret_token=secret)
     else:
-        # Fallback: manually wire the webhook handler and manage app lifecycle
+        # Manual fallback
         aio = web.Application()
-
-        # PTB lifecycle when embedding in a custom server:
         await ptb_app.initialize()
         await ptb_app.start()
-
-        # Route for Telegram updates (POST)
         aio.add_routes([web.post(f"/{path}", ptb_app.webhook_handler)])
-
         async def on_cleanup(_):
-            # Graceful shutdown for PTB
             await ptb_app.stop()
             await ptb_app.shutdown()
-
         aio.on_cleanup.append(on_cleanup)
 
     # Health endpoints for Render
     async def health(_: web.Request):
         return web.Response(text="ok")
+    aio.add_routes([web.get("/healthz", health), web.get("/", health)])
 
-    aio.add_routes([web.get("/", health), web.get("/healthz", health)])
-
-    # Bind server
+    # ---- Bind HTTP server FIRST so Render sees an open port ----
     port = int(os.environ.get("PORT", "10000"))
     runner = web.AppRunner(aio)
     await runner.setup()
     site = web.TCPSite(runner, "0.0.0.0", port)
-    log.info("Binding server on 0.0.0.0:%s path=/%s", port, path)
     await site.start()
+    log.info("Listening on 0.0.0.0:%s (health: /healthz, webhook: /%s)", port, path)
+
+    # ---- THEN set Telegram webhook (non-blocking for Render health) ----
+    base = (cfg.WEBHOOK_URL or os.getenv("RENDER_EXTERNAL_URL") or "").rstrip("/")
+    if base and base.startswith("https://"):
+        full_url = f"{base}/{path}"
+        try:
+            await ptb_app.bot.set_webhook(url=full_url, secret_token=secret, drop_pending_updates=True)
+            log.info("Webhook set: %s", full_url)
+        except Exception:
+            log.exception("set_webhook failed")
+    else:
+        log.warning("WEBHOOK_URL missing or not https; skipping set_webhook. Service will still pass health checks.")
 
     # keep running
     await asyncio.Event().wait()
