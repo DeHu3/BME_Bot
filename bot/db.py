@@ -1,81 +1,70 @@
 # bot/db.py
-from __future__ import annotations
-
-from typing import Optional, List, Dict
+import os
 import asyncpg
-
+from typing import Iterable
 
 class SubscriberDB:
-    def __init__(self, dsn: str):
-        self._dsn = dsn
-        self._pool: Optional[asyncpg.Pool] = None
+    """Asynchronous DB helper for Render Postgres."""
 
-    async def pool(self) -> asyncpg.Pool:
-        """Lazily create/get an asyncpg pool."""
+    def __init__(self) -> None:
+        # Read connection parameters from environment variables
+        # Example: postgres://user:password@hostname:5432/dbname
+        self.database_url = os.environ.get("DATABASE_URL")
+        self._pool: asyncpg.Pool | None = None
+
+    async def get_pool(self) -> asyncpg.Pool:
+        """Initialize (if necessary) and return the connection pool."""
         if self._pool is None:
-            self._pool = await asyncpg.create_pool(self._dsn, min_size=1, max_size=4)
+            self._pool = await asyncpg.create_pool(self.database_url, min_size=1, max_size=5)
         return self._pool
 
     async def ensure_schema(self) -> None:
-        pool = await self.pool()
-        async with pool.acquire() as con:
-            # subscriber groups (topic + chat_id)
-            await con.execute("""
-            CREATE TABLE IF NOT EXISTS subscriptions(
-                topic   TEXT   NOT NULL,
-                chat_id BIGINT NOT NULL,
-                PRIMARY KEY (topic, chat_id)
+        """Ensure that required tables exist."""
+        pool = await self.get_pool()
+        async with pool.acquire() as conn:
+            await conn.execute("""
+            CREATE TABLE IF NOT EXISTS subs (
+                list_name TEXT PRIMARY KEY,
+                subs BIGINT[] NOT NULL
             );
-            """)
-            # simple KV state storage (cursor/counters, etc.)
-            await con.execute("""
-            CREATE TABLE IF NOT EXISTS kv_state(
-                key   TEXT  PRIMARY KEY,
-                value JSONB NOT NULL
+            CREATE TABLE IF NOT EXISTS state (
+                key TEXT PRIMARY KEY,
+                value JSONB
             );
             """)
 
-    # ----- subscriptions -----
+    async def get_subs(self, list_name: str) -> set[int]:
+        """Return the subscriber IDs for a given list."""
+        pool = await self.get_pool()
+        async with pool.acquire() as conn:
+            row = await conn.fetchrow("SELECT subs FROM subs WHERE list_name=$1", list_name)
+            return set(row["subs"]) if row else set()
 
-    async def add_sub(self, topic: str, chat_id: int) -> None:
-        pool = await self.pool()
-        async with pool.acquire() as con:
-            await con.execute(
-                "INSERT INTO subscriptions(topic, chat_id) VALUES($1, $2) "
-                "ON CONFLICT DO NOTHING;",
-                topic, chat_id
-            )
+    async def save_subs(self, list_name: str, subs: Iterable[int]) -> None:
+        """Persist subscriber IDs for a given list."""
+        pool = await self.get_pool()
+        async with pool.acquire() as conn:
+            await conn.execute("""
+                INSERT INTO subs (list_name, subs)
+                VALUES ($1, $2)
+                ON CONFLICT (list_name)
+                DO UPDATE SET subs = EXCLUDED.subs
+            """, list_name, list(subs))
 
-    async def remove_sub(self, topic: str, chat_id: int) -> None:
-        pool = await self.pool()
-        async with pool.acquire() as con:
-            await con.execute(
-                "DELETE FROM subscriptions WHERE topic=$1 AND chat_id=$2;",
-                topic, chat_id
-            )
+    async def get_state(self, key: str) -> dict:
+        """Get stored state (cursor) for cron jobs."""
+        pool = await self.get_pool()
+        async with pool.acquire() as conn:
+            row = await conn.fetchrow("SELECT value FROM state WHERE key=$1", key)
+            return row["value"] if row else {}
 
-    async def get_subs(self, topic: str) -> List[int]:
-        pool = await self.pool()
-        async with pool.acquire() as con:
-            rows = await con.fetch(
-                "SELECT chat_id FROM subscriptions WHERE topic=$1;",
-                topic
-            )
-        return [r["chat_id"] for r in rows]
-
-    # ----- state -----
-
-    async def get_state(self, key: str) -> Dict:
-        pool = await self.pool()
-        async with pool.acquire() as con:
-            row = await con.fetchrow("SELECT value FROM kv_state WHERE key=$1;", key)
-        return {} if row is None else row["value"]
-
-    async def save_state(self, key: str, value: Dict) -> None:
-        pool = await self.pool()
-        async with pool.acquire() as con:
-            await con.execute(
-                "INSERT INTO kv_state(key, value) VALUES($1, $2) "
-                "ON CONFLICT (key) DO UPDATE SET value=EXCLUDED.value;",
-                key, value
-            )
+    async def save_state(self, key: str, value: dict) -> None:
+        """Persist state (cursor) between cron runs."""
+        pool = await self.get_pool()
+        async with pool.acquire() as conn:
+            await conn.execute("""
+                INSERT INTO state (key, value)
+                VALUES ($1, $2)
+                ON CONFLICT (key)
+                DO UPDATE SET value = EXCLUDED.value
+            """, key, value)
