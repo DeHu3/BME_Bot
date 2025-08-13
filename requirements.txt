@@ -1,5 +1,5 @@
 pydantic>=2
-pydantic-settings>=2.2
+pydantic-settings>=2
 python-telegram-bot[webhooks]==20.7
 aiohttp==3.9.5
 asyncpg==0.29.0
