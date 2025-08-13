@@ -10,15 +10,17 @@ class SubscriberDB:
       - subscriptions(topic TEXT, chat_id BIGINT, PK(topic, chat_id))
       - kv_state(k TEXT PRIMARY KEY, v JSONB NOT NULL)
     """
+    _pools: dict[str, asyncpg.Pool] = {}
 
     def __init__(self, dsn: str):
         self._dsn = dsn
-        self._pool: Optional[asyncpg.Pool] = None
 
     async def pool(self) -> asyncpg.Pool:
-        if self._pool is None:
-            self._pool = await asyncpg.create_pool(self._dsn, min_size=1, max_size=5)
-        return self._pool
+        pool = self._pools.get(self._dsn)
+        if pool is None:
+            pool = await asyncpg.create_pool(self._dsn, min_size=1, max_size=5)
+            self._pools[self._dsn] = pool
+        return pool
 
     async def ensure_schema(self) -> None:
         pool = await self.pool()
