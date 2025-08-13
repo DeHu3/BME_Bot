@@ -11,4 +11,7 @@ RUN pip install --no-cache-dir -r requirements.txt
 
 COPY . .
 
+# help Render detect the listening port
+EXPOSE 10000
+
 CMD ["python", "-m", "bot.webhook_app"]
