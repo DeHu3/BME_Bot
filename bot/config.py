@@ -20,6 +20,7 @@ class Settings(BaseSettings):
     RENDER_MINT: str                                # Solana RNDR mint (REQUIRED)
     RENDER_BURN_ADDRESS: str                        # The burn/deposit address you want to watch (REQUIRED)
     COINGECKO_ID: str = "render-token"              # Optional, defaults to CoinGecko's RNDR ID
+    BURN_VAULT_ADDRESS: str = ""  # set in Render env to your RNDR burn deposit ATA (…7vq)
 
     model_config = SettingsConfigDict(env_file=".env", extra="ignore")
 
