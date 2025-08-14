@@ -1,207 +1,138 @@
 # bot/sources.py
-from __future__ import annotations
-
-import time
-from typing import Any, Dict, List, Optional, Tuple
-
+import os
+from typing import List, Dict, Any, Tuple
 import httpx
 
-from bot.db import SubscriberDB
+# Solana's well-known incinerator "owner" address.
+INCINERATOR_OWNER = "1nc1nerator11111111111111111111111111111111"
 
-
-# ---------- Formatting helpers ----------
-
-def _fmt_amount(n: float) -> str:
-    # 1,234.56
-    return f"{n:,.2f}"
-
-def _fmt_usd(n: float) -> str:
-    # $1,234.56
-    return f"${n:,.2f}"
-
-def format_burn(ev: Dict[str, Any]) -> str:
-    """
-    Build the exact message you asked for, using only `ev` fields.
-    `ev` is expected to contain:
-      amount (float), usd (float), signature (str),
-      s24, s7, s30 – each is a tuple (amount_sum, usd_sum)
-    """
-    amt = float(ev.get("amount", 0.0))
-    usd = float(ev.get("usd", 0.0))
-    sig = ev.get("signature", "")
-
-    s24a, s24u = ev.get("s24", (0.0, 0.0))
-    s7a,  s7u  = ev.get("s7",  (0.0, 0.0))
-    s30a, s30u = ev.get("s30", (0.0, 0.0))
-
-    solscan = f"https://solscan.io/tx/{sig}" if sig else ""
-
-    lines = [
-        f"🔥 {_fmt_amount(amt)} RENDER ({_fmt_usd(usd)}) · View on Solscan: {solscan}",
-        f"📊 24 hours: {_fmt_amount(s24a)} RENDER ({_fmt_usd(s24u)})",
-        f"📊 7 days:   {_fmt_amount(s7a)} RENDER ({_fmt_usd(s7u)})",
-        f"📊 30 days:  {_fmt_amount(s30a)} RENDER ({_fmt_usd(s30u)})",
-    ]
-    return "\n".join(lines)
-
-
-# ---------- External APIs ----------
-
-async def _coingecko_price_at(ts_unix: int,
-                              client: httpx.AsyncClient,
-                              coingecko_id: str = "render-token") -> Optional[float]:
-    """
-    Price of RNDR (USD) *at* the approximate time of the burn.
-    Uses a ±15min window and picks the sample closest to ts_unix.
-    """
-    frm = max(0, ts_unix - 900)
-    to  = ts_unix + 900
-    url = (
-        f"https://api.coingecko.com/api/v3/coins/{coingecko_id}"
-        f"/market_chart/range?vs_currency=usd&from={frm}&to={to}"
-    )
+async def _get_price_usd(coingecko_id: str = "render-token") -> float:
+    """Fetch current USD price for RNDR (approximation for alert)."""
+    url = "https://api.coingecko.com/api/v3/simple/price"
+    params = {"ids": coingecko_id, "vs_currencies": "usd"}
     try:
-        r = await client.get(url, timeout=20)
-        r.raise_for_status()
-        data = r.json()
-        prices = data.get("prices") or []
-        if not prices:
-            return None
-        # prices is [[ms, price], ...]
-        best_price = None
-        best_diff = 10**18
-        for ms, price in prices:
-            diff = abs(ms // 1000 - ts_unix)
-            if diff < best_diff:
-                best_diff = diff
-                best_price = float(price)
-        return best_price
-    except Exception:
-        return None
-
-
-async def _hel_adr_txs(
-    api_key: str,
-    address: str,
-    limit: int = 50,
-    before: Optional[str] = None,
-) -> List[Dict[str, Any]]:
-    """
-    Helius Enhanced API: newest → oldest transactions involving `address`.
-    https://api.helius.xyz/v0/addresses/{address}/transactions?api-key=...&limit=...&before=...
-    """
-    base = f"https://api.helius.xyz/v0/addresses/{address}/transactions?api-key={api_key}&limit={limit}"
-    if before:
-        base += f"&before={before}"
-    async with httpx.AsyncClient() as client:
-        try:
-            r = await client.get(base, timeout=30)
+        async with httpx.AsyncClient(timeout=10) as client:
+            r = await client.get(url, params=params)
             r.raise_for_status()
             data = r.json()
-            return data if isinstance(data, list) else []
+            return float(data.get(coingecko_id, {}).get("usd", 0)) or 0.0
+    except Exception:
+        return 0.0
+
+def _extract_amount(transfer: Dict[str, Any]) -> float:
+    """Be lenient with shapes Helius may return."""
+    # preferred already-decimal field
+    if isinstance(transfer.get("tokenAmount"), (int, float, str)):
+        try:
+            return float(transfer["tokenAmount"])
         except Exception:
-            return []
+            pass
 
+    # integer + decimals path
+    raw = transfer.get("amount")
+    dec = transfer.get("decimals")
+    if isinstance(raw, int) and isinstance(dec, int) and dec > 0:
+        return raw / (10 ** dec)
 
-# ---------- Public entry used by webhook_app.run_burn_once ----------
+    try:
+        return float(raw or 0)
+    except Exception:
+        return 0.0
 
-async def get_new_burns(cfg, state: Dict[str, Any]) -> List[Dict[str, Any]]:
+async def get_new_burns(cfg, state: dict) -> List[Dict[str, Any]]:
     """
-    Returns a list of *new* burn deposit events since the last cursor in `state`.
-    Each returned dict is ready for `format_burn(ev)` and looks like:
-      {
-        "signature": str,
-        "ts": int,
-        "amount": float,        # RNDR amount
-        "price_usd": float|None,
-        "usd": float,           # amount * price_usd (0 if price missing)
-        "s24": (amount_sum, usd_sum),
-        "s7":  (amount_sum, usd_sum),
-        "s30": (amount_sum, usd_sum),
-      }
-
-    Logic:
-      • Query Helius Enhanced API for transactions to the burn address.
-      • Filter tokenTransfers where mint == RENDER_MINT and toUserAccount == burn address.
-      • For each, fetch price-at-time from CoinGecko, record in DB, compute running sums.
-      • Mutate `state["cursor"]` so next run only sees newer txs.
+    Return new *deposits* of RNDR into the incinerator (most frequent signal).
+    Cursor: state['last_sig'] (latest processed transaction signature).
+    Each event: {'signature','ts','amount','price_usd'}.
     """
-    api_key   = (getattr(cfg, "HELIUS_API_KEY", "") or "").strip()
-    mint      = (getattr(cfg, "RENDER_MINT", "") or "").strip()
-    burn_to   = (getattr(cfg, "RENDER_BURN_ADDRESS", "") or "").strip()
-    cg_id     = (getattr(cfg, "COINGECKO_ID", "render-token") or "render-token").strip()
-    database  = getattr(cfg, "DATABASE_URL")
-
-    if not api_key or not mint or not burn_to:
-        # Without these, we can't detect events – return empty so the bot stays healthy.
+    api_key = getattr(cfg, "HELIUS_API_KEY", "") or ""
+    if not api_key:
         return []
 
-    # Pull newest set; if there’s a saved cursor, we’ll stop when we reach it.
-    saved_cursor = (state or {}).get("cursor")
-    txs = await _hel_adr_txs(api_key, burn_to, limit=50, before=None)
+    base = f"https://api.helius.xyz/v0/addresses/{INCINERATOR_OWNER}/transactions"
+    params = {"api-key": api_key, "limit": 100}
 
-    # Build "new" list by walking until the saved cursor (newest-first array).
-    new_txs: List[Dict[str, Any]] = []
+    async with httpx.AsyncClient(timeout=20) as client:
+        r = await client.get(base, params=params)
+        r.raise_for_status()
+        txs = r.json()
+
+    # fetch USD price once for this run (approximate "at time" value)
+    sym_filter = (getattr(cfg, "RNDR_SYMBOL", "RNDR") or "RNDR").upper()
+    price_usd = await _get_price_usd(getattr(cfg, "COINGECKO_ID", "render-token"))
+
+    last_sig = state.get("last_sig")
+    new_events: List[Dict[str, Any]] = []
+
     for tx in txs:
         sig = tx.get("signature")
-        if saved_cursor and sig == saved_cursor:
+        if not sig:
+            continue
+        # stop at the last processed signature
+        if last_sig and sig == last_sig:
             break
-        new_txs.append(tx)
 
-    # Process oldest → newest so alerts are in chronological order.
-    new_txs.reverse()
+        ts = int(tx.get("timestamp") or tx.get("blockTime") or 0)
 
-    if txs:
-        # Update cursor to newest we saw in this batch
-        state["cursor"] = txs[0].get("signature")
+        # token transfers may be in different places depending on Helius version
+        transfers = tx.get("tokenTransfers") or []
+        if not transfers:
+            ev = tx.get("events") or {}
+            transfers = ev.get("tokenTransfers") or []
 
-    if not new_txs:
-        return []
+        for tr in transfers:
+            # We only want inbound RNDR to accounts owned by the incinerator.
+            sym = (tr.get("symbol") or tr.get("tokenSymbol") or "").upper()
+            to_owner = (tr.get("toUserAccountOwner") or tr.get("toOwner") or "").strip()
+            to_acct = (tr.get("toUserAccount") or "").strip()
 
-    db = SubscriberDB(database)
-    out_events: List[Dict[str, Any]] = []
+            if sym != sym_filter:
+                continue
 
-    async with httpx.AsyncClient() as client:
-        for tx in new_txs:
-            sig = tx.get("signature", "")
-            ts  = int(tx.get("timestamp") or time.time())
+            # Accept if owner matches. Fallback: account equals incinerator (rare).
+            if to_owner != INCINERATOR_OWNER and to_acct != INCINERATOR_OWNER:
+                continue
 
-            token_transfers = tx.get("tokenTransfers") or []
-            for tt in token_transfers:
-                try:
-                    if tt.get("mint") != mint:
-                        continue
+            amount = _extract_amount(tr)
+            if amount <= 0:
+                continue
 
-                    # For deposits to the burn address (incinerator or your burn vault),
-                    # Helius' "toUserAccount" should be that burn address
-                    to_user = (tt.get("toUserAccount") or "").strip()
-                    if to_user != burn_to:
-                        continue
-
-                    # amount can be in 'tokenAmount' (decimal string) or 'amount' (float-like)
-                    raw_amt = tt.get("tokenAmount") or tt.get("amount") or "0"
-                    amount  = float(raw_amt)
-                except Exception:
-                    continue
-
-                price = await _coingecko_price_at(ts, client, cg_id)
-                usd   = (price or 0.0) * amount
-
-                # Persist this burn (ON CONFLICT DO NOTHING prevents dupes).
-                await db.record_burn(sig, ts, amount, price)
-
-                # Pull updated rolling sums AFTER recording the burn.
-                s24, s7, s30 = await db.sums_24_7_30()
-
-                out_events.append({
+            new_events.append(
+                {
                     "signature": sig,
                     "ts": ts,
                     "amount": amount,
-                    "price_usd": price,
-                    "usd": usd,
-                    "s24": s24,
-                    "s7":  s7,
-                    "s30": s30,
-                })
+                    "price_usd": price_usd if price_usd > 0 else None,
+                }
+            )
 
-    return out_events
+    # Update cursor to newest seen signature (top of list) so we don't re-alert.
+    if txs:
+        newest = txs[0].get("signature")
+        if newest:
+            state["last_sig"] = newest
+
+    return new_events
+
+def format_burn(ev: Dict[str, Any], totals: Tuple[Tuple[float, float], Tuple[float, float], Tuple[float, float]]) -> str:
+    """
+    totals: ((a24,u24),(a7,u7),(a30,u30))
+    """
+    amt = float(ev["amount"])
+    p = float(ev.get("price_usd") or 0.0)
+    usd = amt * p if p else 0.0
+
+    def fmt_pair(t):
+        a, u = t
+        return f"{a:,.2f} RNDR (${u:,.2f})"
+
+    s24, s7, s30 = totals
+    lines = [
+        "🔥 RNDR burn detected",
+        f"Just now: {amt:,.2f} RNDR" + (f" (${usd:,.2f})" if usd else ""),
+        f"24h: {fmt_pair(s24)}",
+        f"7d: {fmt_pair(s7)}",
+        f"30d: {fmt_pair(s30)}",
+        f"Tx: https://solscan.io/tx/{ev['signature']}",
+    ]
+    return "\n".join(lines)
