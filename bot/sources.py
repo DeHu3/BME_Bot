@@ -1,15 +1,92 @@
 # bot/sources.py
-import os
+from __future__ import annotations
+
 import asyncio
-from typing import List, Dict, Any, Tuple, Optional
+from typing import List, Dict, Any, Tuple
 import httpx
+from logging import getLogger
 
-# ---------- small helpers ----------
+log = getLogger("sources")
 
-async def _get_price_usd(coingecko_id: str = "render") -> float:
+# ---- Helpers ---------------------------------------------------------------
+
+async def _get_json_with_backoff(url: str, headers: Dict[str, str], params: Dict[str, Any] | None,
+                                 max_attempts: int = 6) -> Any:
     """
-    Fetch current USD price for RENDER (approximation for alert).
-    If you need precise historical-at-timestamp pricing later, we can replace this.
+    GET with exponential backoff. Explicitly handle 401/429 and 5xx.
+    """
+    delay = 0.5
+    last_exc: Exception | None = None
+
+    for attempt in range(1, max_attempts + 1):
+        try:
+            async with httpx.AsyncClient(timeout=20) as client:
+                resp = await client.get(url, headers=headers, params=params)
+            if resp.status_code == 401:
+                # Auth problem - no point retrying unless env is fixed
+                resp.raise_for_status()
+            if resp.status_code == 429:
+                # Respect Retry-After when present
+                ra = resp.headers.get("Retry-After")
+                if ra:
+                    try:
+                        delay = max(delay, float(ra))
+                    except Exception:
+                        pass
+                await asyncio.sleep(delay)
+                delay = min(delay * 2, 10)
+                last_exc = httpx.HTTPStatusError("429 Too Many Requests", request=resp.request, response=resp)
+                continue
+
+            # Raise on any other non-2xx status
+            resp.raise_for_status()
+            return resp.json()
+
+        except httpx.HTTPStatusError as e:
+            last_exc = e
+            code = e.response.status_code if e.response is not None else None
+            if code in (500, 502, 503, 504):
+                await asyncio.sleep(delay)
+                delay = min(delay * 2, 10)
+                continue
+            break  # 4xx that we can't fix with a retry (e.g. 401, 404)
+        except Exception as e:
+            last_exc = e
+            await asyncio.sleep(delay)
+            delay = min(delay * 2, 10)
+            continue
+
+    assert last_exc is not None
+    raise last_exc
+
+
+def _extract_amount(transfer: Dict[str, Any]) -> float:
+    """
+    Extract decimal token amount robustly for Helius shapes.
+    """
+    # Preferred already-decimal field
+    if isinstance(transfer.get("tokenAmount"), (int, float, str)):
+        try:
+            return float(transfer["tokenAmount"])
+        except Exception:
+            pass
+
+    # integer + decimals path
+    raw = transfer.get("amount")
+    dec = transfer.get("decimals")
+    if isinstance(raw, int) and isinstance(dec, int) and dec > 0:
+        return raw / (10 ** dec)
+
+    try:
+        return float(raw or 0)
+    except Exception:
+        return 0.0
+
+
+async def _get_price_usd_current(coingecko_id: str = "render") -> float:
+    """
+    Fetch current USD price for RENDER (approximation).
+    Using current price (not exact historical) keeps us simple & within limits.
     """
     url = "https://api.coingecko.com/api/v3/simple/price"
     params = {"ids": coingecko_id, "vs_currencies": "usd"}
@@ -23,136 +100,77 @@ async def _get_price_usd(coingecko_id: str = "render") -> float:
         return 0.0
 
 
-def _extract_amount(transfer: Dict[str, Any]) -> float:
-    """
-    Be lenient about shapes Helius may return. Prefer already-decimal 'tokenAmount',
-    otherwise compute amount = raw / (10 ** decimals).
-    """
-    # preferred decimal field if present
-    if "tokenAmount" in transfer:
-        try:
-            return float(transfer["tokenAmount"])
-        except Exception:
-            pass
-
-    raw = transfer.get("amount")
-    dec = transfer.get("decimals")
-    if isinstance(raw, int) and isinstance(dec, int) and dec > 0:
-        return raw / (10 ** dec)
-    try:
-        return float(raw or 0)
-    except Exception:
-        return 0.0
-
-
-async def _get_json_with_backoff(
-    url: str,
-    headers: Dict[str, str],
-    params: Optional[Dict[str, Any]] = None,
-    max_attempts: int = 6,
-    base_delay: float = 0.6,
-) -> Any:
-    """
-    GET with exponential backoff for 429 and 5xx. We *do not* include the API key
-    in query params to avoid leaking it in logs. Auth is via headers.
-    """
-    last_resp: Optional[httpx.Response] = None
-    for attempt in range(1, max_attempts + 1):
-        try:
-            async with httpx.AsyncClient(timeout=20) as client:
-                resp = await client.get(url, headers=headers, params=params)
-            # handle throttling and transient server errors
-            if resp.status_code == 429 or 500 <= resp.status_code < 600:
-                last_resp = resp
-                # Respect Retry-After if present
-                ra = resp.headers.get("Retry-After")
-                delay = float(ra) if ra and ra.isdigit() else base_delay * (2 ** (attempt - 1))
-                await asyncio.sleep(min(delay, 10.0))
-                continue
-            resp.raise_for_status()
-            return resp.json()
-        except httpx.HTTPStatusError as e:
-            # If it's a 401, don't retry forever—this is an auth/config issue
-            if e.response.status_code == 401:
-                raise
-            last_resp = e.response
-            await asyncio.sleep(base_delay * (2 ** (attempt - 1)))
-        except (httpx.TransportError, httpx.TimeoutException):
-            await asyncio.sleep(base_delay * (2 ** (attempt - 1)))
-    if last_resp is not None:
-        last_resp.raise_for_status()
-    raise RuntimeError("HTTP request failed after retries")
-
-
-# ---------- main fetch & format API ----------
+# ---- Main entry used by webhook_app.run_burn_once --------------------------
 
 async def get_new_burns(cfg, state: dict) -> List[Dict[str, Any]]:
     """
-    Return new *deposits* of RENDER into the burn vault (most frequent signal).
+    Return new *deposits* of RENDER into the configured burn vault address.
     Cursor: state['last_sig'] (latest processed transaction signature).
     Each event: {'signature','ts','amount','price_usd'}.
+
+    Reads from cfg:
+      - HELIUS_API_KEY (string, required)
+      - BURN_VAULT_ADDRESS or RENDER_BURN_ADDRESS (string, required)
+      - RENDER_SYMBOL (optional, default "RENDER")
     """
-    # Load API key safely; work even if Settings doesn’t declare it
-    api_key = (getattr(cfg, "HELIUS_API_KEY", "") or os.getenv("HELIUS_API_KEY", "")).strip()
-    if not api_key:
-        # No key configured -> nothing to fetch
-        return []
+    api_key = (getattr(cfg, "HELIUS_API_KEY", "") or "").strip()
+    burn_vault = (getattr(cfg, "BURN_VAULT_ADDRESS", "") or getattr(cfg, "RENDER_BURN_ADDRESS", "") or "").strip()
+    symbol = (getattr(cfg, "RENDER_SYMBOL", "RENDER") or "RENDER").upper()
 
-    # Figure out which address to watch:
-    # Prefer BURN_VAULT_ADDRESS, fallback to RENDER_BURN_ADDRESS, then env.
-    burn_vault = (
-        (getattr(cfg, "BURN_VAULT_ADDRESS", "") or "").strip()
-        or (getattr(cfg, "RENDER_BURN_ADDRESS", "") or "").strip()
-        or os.getenv("BURN_VAULT_ADDRESS", "").strip()
-        or os.getenv("RENDER_BURN_ADDRESS", "").strip()
-    )
     if not burn_vault:
-        # No address configured -> nothing to fetch
+        log.error("BURN_VAULT_ADDRESS/RENDER_BURN_ADDRESS is missing")
         return []
 
-    url = f"https://api.helius.xyz/v0/addresses/{burn_vault}/transactions"
+    if not api_key:
+        # Make it loud & clear in logs; returning [] avoids spamming retries
+        log.error("HELIUS_API_KEY is missing on the WEB SERVICE environment")
+        return []
 
-    # Use header auth only so your key never appears in logs
+    base = f"https://api.helius.xyz/v0/addresses/{burn_vault}/transactions"
+
+    # Belt + suspenders auth: send both header and query param
     headers = {
         "x-api-key": api_key,
         "accept": "application/json",
-        "user-agent": "bme-bot/1.0",
+        "user-agent": "bme-bot/1.0"
     }
-    params = {"limit": 100}
+    params = {"limit": 100, "api-key": api_key}
 
-    txs: List[Dict[str, Any]] = await _get_json_with_backoff(url, headers, params=params, max_attempts=6)
+    # Download recent transactions with backoff
+    txs: List[Dict[str, Any]] = await _get_json_with_backoff(base, headers, params)
 
     last_sig = state.get("last_sig")
     new_events: List[Dict[str, Any]] = []
 
-    # We only want RENDER (not old RNDR). You can override via env RNDR_SYMBOL=RENDER if needed.
-    sym_filter = (getattr(cfg, "RNDR_SYMBOL", "RENDER") or "RENDER").upper()
-
-    # Approximate USD price once per run (optional; set COINGECKO_ID if needed)
-    price_usd = await _get_price_usd(getattr(cfg, "COINGECKO_ID", "render"))
+    # Fetch the (approximate) current price once to annotate this batch
+    price_usd = await _get_price_usd_current("render")
 
     for tx in txs:
         sig = tx.get("signature")
         if not sig:
             continue
-        # stop at the last processed signature
+        # Stop once we hit the last processed signature
         if last_sig and sig == last_sig:
             break
 
         ts = int(tx.get("timestamp") or tx.get("blockTime") or 0)
 
-        # token transfers can be in different shapes; try both
-        transfers = tx.get("tokenTransfers") or (tx.get("events") or {}).get("tokenTransfers") or []
+        transfers = tx.get("tokenTransfers") or []
+        if not transfers:
+            ev = tx.get("events") or {}
+            transfers = ev.get("tokenTransfers") or []
+
+        # Accept any inbound RENDER transfer to this vault address
         for tr in transfers:
             sym = (tr.get("symbol") or tr.get("tokenSymbol") or "").upper()
-            if sym != sym_filter:
+            if sym != symbol:
                 continue
 
-            to_acct = (tr.get("toUserAccount") or tr.get("toTokenAccount") or tr.get("toAccount") or "").strip()
-            to_owner = (tr.get("toUserAccountOwner") or tr.get("toOwner") or "").strip()
+            # Helius shapes use either user account or token account in "to*"
+            to_user = (tr.get("toUserAccount") or "").strip()
+            to_token = (tr.get("toTokenAccount") or "").strip()
 
-            # Accept if the *destination* matches the burn vault (account or owner)
-            if to_acct != burn_vault and to_owner != burn_vault:
+            if to_user != burn_vault and to_token != burn_vault:
                 continue
 
             amount = _extract_amount(tr)
@@ -168,7 +186,7 @@ async def get_new_burns(cfg, state: dict) -> List[Dict[str, Any]]:
                 }
             )
 
-    # Update cursor to the newest seen signature to prevent re-alerts
+    # Update cursor to newest signature if we got any txs
     if txs:
         newest = txs[0].get("signature")
         if newest:
@@ -177,10 +195,8 @@ async def get_new_burns(cfg, state: dict) -> List[Dict[str, Any]]:
     return new_events
 
 
-def format_burn(
-    ev: Dict[str, Any],
-    totals: Tuple[Tuple[float, float], Tuple[float, float], Tuple[float, float]],
-) -> str:
+def format_burn(ev: Dict[str, Any],
+                totals: Tuple[Tuple[float, float], Tuple[float, float], Tuple[float, float]]) -> str:
     """
     totals: ((a24,u24),(a7,u7),(a30,u30))
     """
@@ -188,7 +204,7 @@ def format_burn(
     p = float(ev.get("price_usd") or 0.0)
     usd = amt * p if p else 0.0
 
-    def fmt_pair(t):
+    def fmt_pair(t: Tuple[float, float]) -> str:
         a, u = t
         return f"{a:,.2f} RENDER (${u:,.2f})"
 
