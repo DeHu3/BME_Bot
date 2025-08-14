@@ -3,14 +3,15 @@ from __future__ import annotations
 
 from typing import List, Dict, Any, Tuple
 import os
+import asyncio
 import httpx
 
 # ---- Price helpers ----------------------------------------------------------
 
 async def _get_price_usd(coingecko_id: str = "render-token") -> float:
     """
-    Fetch current USD price (approximation for alert). If CG is rate-limited or
-    unavailable, return 0.0 and the message will omit USD for the single event.
+    Fetch current USD price (approx for alert). If rate-limited/unavailable,
+    return 0.0 and the single-event USD will be omitted.
     """
     url = "https://api.coingecko.com/api/v3/simple/price"
     params = {"ids": coingecko_id, "vs_currencies": "usd"}
@@ -31,14 +32,12 @@ def _extract_amount(transfer: Dict[str, Any]) -> float:
     Helius can return either a pre-decimal 'tokenAmount' or (amount, decimals).
     Handle both safely.
     """
-    # preferred, already-decimal
     if "tokenAmount" in transfer:
         try:
             return float(transfer["tokenAmount"])
         except Exception:
             pass
 
-    # integer + decimals
     raw = transfer.get("amount")
     dec = transfer.get("decimals")
     if isinstance(raw, int) and isinstance(dec, int) and dec > 0:
@@ -48,6 +47,38 @@ def _extract_amount(transfer: Dict[str, Any]) -> float:
         return float(raw or 0)
     except Exception:
         return 0.0
+
+
+async def _get_json_with_backoff(url: str, headers: Dict[str, str], params: Dict[str, Any]) -> Any:
+    """
+    GET with gentle exponential backoff for 429/5xx. Returns parsed JSON or []
+    after exhausting retries. Keeps errors away from your cron handler.
+    """
+    delay = 1.0
+    max_attempts = 4
+    async with httpx.AsyncClient(timeout=20) as client:
+        for attempt in range(max_attempts):
+            r = await client.get(url, headers=headers, params=params)
+            # Handle rate-limits and transient server errors with backoff
+            if r.status_code == 429 or 500 <= r.status_code < 600:
+                # Honor Retry-After if provided, otherwise backoff
+                retry_after = r.headers.get("retry-after")
+                try:
+                    wait = float(retry_after) if retry_after else delay
+                except Exception:
+                    wait = delay
+                await asyncio.sleep(wait)
+                delay = min(delay * 2, 10.0)
+                if attempt + 1 == max_attempts:
+                    return []
+                continue
+            # Any other non-2xx should raise (caller expects [] on exception)
+            r.raise_for_status()
+            try:
+                return r.json() or []
+            except Exception:
+                return []
+    return []
 
 
 # ---- Main API ---------------------------------------------------------------
@@ -69,7 +100,6 @@ async def get_new_burns(
     # 1) API key (prefer env or cfg)
     api_key = (getattr(cfg, "HELIUS_API_KEY", "") or os.environ.get("HELIUS_API_KEY", "")).strip()
     if not api_key:
-        # No key configured -> nothing we can do; caller should just no-op.
         return []
 
     # 2) Which vault address to monitor
@@ -80,21 +110,17 @@ async def get_new_burns(
         or (getattr(cfg, "BURN_VAULT_ADDRESS", "") or "").strip()
     )
     if not addr:
-        # No address configured -> nothing to fetch
         return []
 
-    # 3) Request newest transactions for that address (limit 100 is OK for minute cron)
+    # 3) Request newest transactions for that address
     url = f"https://api.helius.xyz/v0/addresses/{addr}/transactions"
     headers = {"x-api-key": api_key}
     params = {"limit": 100}
 
-    async with httpx.AsyncClient(timeout=20) as client:
-        r = await client.get(url, headers=headers, params=params)
-        r.raise_for_status()
-        txs = r.json() or []
-
-    # Single run price (approximate for per-event USD)
-    price_usd = await _get_price_usd(getattr(cfg, "COINGECKO_ID", "render-token"))
+    txs = await _get_json_with_backoff(url, headers, params)
+    if not isinstance(txs, list):
+        # If Helius responded with some unexpected payload or we exhausted retries
+        return []
 
     last_sig = state.get("last_sig")
     events: List[Dict[str, Any]] = []
@@ -103,7 +129,6 @@ async def get_new_burns(
         sig = tx.get("signature")
         if not sig:
             continue
-
         # Stop when we reach the last processed tx
         if last_sig and sig == last_sig:
             break
@@ -131,7 +156,8 @@ async def get_new_burns(
                     "signature": sig,
                     "ts": ts,
                     "amount": amount,
-                    "price_usd": price_usd if price_usd > 0 else None,
+                    # Set price later (only once) to avoid extra HTTP call if no events
+                    # We'll attach a price below after we know we have events.
                 }
             )
 
@@ -140,6 +166,15 @@ async def get_new_burns(
         newest = txs[0].get("signature")
         if newest:
             state["last_sig"] = newest
+
+    if not events:
+        return []
+
+    # Fetch price once only if we have events
+    price_usd = await _get_price_usd(getattr(cfg, "COINGECKO_ID", "render-token"))
+    if price_usd > 0:
+        for ev in events:
+            ev["price_usd"] = price_usd
 
     return events
 
