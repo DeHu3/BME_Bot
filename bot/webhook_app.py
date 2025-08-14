@@ -25,34 +25,62 @@ def build_ptb_application(cfg: object) -> Application:
     return app
 
 
-# --------- BURN JOB (HTTP CRON TRIGGER USES THIS) ----------
+# --- replace your existing run_burn_once with this one ---
+
+from bot import sources
+
 async def run_burn_once(bot, cfg):
-    """Pull new burns since last cursor and notify all 'burn_subs'."""
+    """
+    Pull new deposits into the burn ATA and notify subscribers.
+    We:
+      1) fetch deposits newer than state (ts/sig)
+      2) look up USD price at tx time
+      3) insert into DB
+      4) compute 24h/7d/30d aggregates
+      5) send a nicely formatted alert to all 'burn_subs'
+    """
     db = SubscriberDB(cfg.DATABASE_URL)
-    state = await db.get_state("burn")
-    events = await sources.get_new_burns(cfg, state)
-    await db.save_state("burn", state)
+    st = await db.get_state("burn_cursor")
+    last_ts = int(st.get("last_ts") or 0)
+    last_sig = st.get("last_sig") or None
+
+    events = await sources.fetch_burn_deposits(
+        cfg.HELIUS_API_KEY, last_ts=last_ts, last_sig=last_sig
+    )
 
     if not events:
         return
 
     subs = await db.get_subs("burn_subs")
     if not subs:
+        # Still update cursor so we don't replay forever
+        newest = events[-1]
+        await db.save_state("burn_cursor", {"last_ts": newest["ts"], "last_sig": newest["signature"]})
         return
 
-    def _fmt(ev):
-        try:
-            return sources.format_burn(ev)
-        except Exception:
-            return f"🔥 Burn event:\n{ev}"
-
     for ev in events:
-        text = _fmt(ev)
+        # Historical price near the tx time
+        price = await sources.usd_price_at(ev["ts"])
+        await db.record_burn(ev["signature"], ev["ts"], ev["amount"], price)
+
+        # Aggregates (USD are "at-time" sums because we store each deposit USD)
+        s24, s7, s30 = await db.sums_24_7_30()
+
+        text = sources.format_burn_message(
+            amount=ev["amount"],
+            usd=(price or 0.0) * ev["amount"],
+            signature=ev["signature"],
+            sum24=s24, sum7=s7, sum30=s30,
+        )
         for chat_id in subs:
             try:
-                await bot.send_message(chat_id, text, disable_web_page_preview=True)
+                await bot.send_message(chat_id, text, parse_mode="HTML", disable_web_page_preview=False)
             except Exception:
-                log.exception("send burn failed chat_id=%s", chat_id)
+                log.exception("Failed to send burn alert to chat_id=%s", chat_id)
+
+    # Advance the cursor to the newest processed tx
+    newest = events[-1]
+    await db.save_state("burn_cursor", {"last_ts": newest["ts"], "last_sig": newest["signature"]})
 
 
 # --------- AIOHTTP ROUTES ----------
