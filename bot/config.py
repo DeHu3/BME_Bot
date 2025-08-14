@@ -1,35 +1,37 @@
 # bot/config.py
 from __future__ import annotations
-import os
-from functools import lru_cache
-from pydantic import Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 class Settings(BaseSettings):
-    TELEGRAM_BOT_TOKEN: str = Field(..., min_length=10)
-    DATABASE_URL: str
-
-    WEBHOOK_URL: str | None = None     # now OPTIONAL
-    WEBHOOK_PATH: str = "tg"
+    # Telegram / server
+    TELEGRAM_BOT_TOKEN: str
+    WEBHOOK_URL: str                      # e.g. https://bme-bot.onrender.com
+    WEBHOOK_PATH: str = "/tg"             # we normalize to exactly one leading slash
     TELEGRAM_WEBHOOK_SECRET: str | None = None
-    CRON_SECRET: str | None = None
 
-    HELIUS_API_KEY: str | None = None
-    HELIUS_BASE: str = "https://mainnet.helius-rpc.com"
+    # Storage / data
+    DATABASE_URL: str
+    HELIUS_API_KEY: str
 
-    RENDER_MINT: str                                # Solana RNDR mint (REQUIRED)
-    RENDER_BURN_ADDRESS: str                        # The burn/deposit address you want to watch (REQUIRED)
-    COINGECKO_ID: str = "render-token"              # Optional, defaults to CoinGecko's RNDR ID
-    BURN_VAULT_ADDRESS: str = ""  # set in Render env to your RNDR burn deposit ATA (…7vq)
+    # Burn vault address: accept either env var name
+    BURN_VAULT_ADDRESS: str | None = None
+    RENDER_BURN_ADDRESS: str | None = None
+
+    # Optional tuning
+    RNDR_SYMBOL: str = "RNDR"
+    COINGECKO_ID: str = "render-token"
+    PORT: int = 10000
 
     model_config = SettingsConfigDict(env_file=".env", extra="ignore")
 
-@lru_cache
-def load_settings() -> Settings:
+def load_settings() -> "Settings":
     s = Settings()
-    if not s.WEBHOOK_URL:
-        # Fallback to Render-provided URL if present
-        base = os.getenv("RENDER_EXTERNAL_URL") or os.getenv("PUBLIC_URL")
-        if base:
-            s.WEBHOOK_URL = base.rstrip("/")
+
+    # Normalize WEBHOOK_PATH to a single leading slash (avoids /tg/tg)
+    s.WEBHOOK_PATH = "/" + (s.WEBHOOK_PATH or "tg").lstrip("/")
+
+    # Unify the two env var names so the rest of the code can always read .BURN_VAULT_ADDRESS
+    if not s.BURN_VAULT_ADDRESS:
+        s.BURN_VAULT_ADDRESS = (s.RENDER_BURN_ADDRESS or "").strip()
+
     return s
