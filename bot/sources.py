@@ -9,10 +9,6 @@ import httpx
 # ---- Price helpers ----------------------------------------------------------
 
 async def _get_price_usd(coingecko_id: str = "render-token") -> float:
-    """
-    Fetch current USD price (approx for alert). If rate-limited/unavailable,
-    return 0.0 and the single-event USD will be omitted.
-    """
     url = "https://api.coingecko.com/api/v3/simple/price"
     params = {"ids": coingecko_id, "vs_currencies": "usd"}
     try:
@@ -28,21 +24,15 @@ async def _get_price_usd(coingecko_id: str = "render-token") -> float:
 # ---- Helpers for Helius payloads -------------------------------------------
 
 def _extract_amount(transfer: Dict[str, Any]) -> float:
-    """
-    Helius can return either a pre-decimal 'tokenAmount' or (amount, decimals).
-    Handle both safely.
-    """
     if "tokenAmount" in transfer:
         try:
             return float(transfer["tokenAmount"])
         except Exception:
             pass
-
     raw = transfer.get("amount")
     dec = transfer.get("decimals")
     if isinstance(raw, int) and isinstance(dec, int) and dec > 0:
         return raw / (10 ** dec)
-
     try:
         return float(raw or 0)
     except Exception:
@@ -50,18 +40,18 @@ def _extract_amount(transfer: Dict[str, Any]) -> float:
 
 
 async def _get_json_with_backoff(url: str, headers: Dict[str, str], params: Dict[str, Any]) -> Any:
-    """
-    GET with gentle exponential backoff for 429/5xx. Returns parsed JSON or []
-    after exhausting retries. Keeps errors away from your cron handler.
-    """
     delay = 1.0
     max_attempts = 4
     async with httpx.AsyncClient(timeout=20) as client:
         for attempt in range(max_attempts):
             r = await client.get(url, headers=headers, params=params)
-            # Handle rate-limits and transient server errors with backoff
+
+            # Immediate graceful returns for auth/forbidden
+            if r.status_code in (401, 403):
+                return []
+
+            # Backoff on 429 or 5xx
             if r.status_code == 429 or 500 <= r.status_code < 600:
-                # Honor Retry-After if provided, otherwise backoff
                 retry_after = r.headers.get("retry-after")
                 try:
                     wait = float(retry_after) if retry_after else delay
@@ -72,7 +62,7 @@ async def _get_json_with_backoff(url: str, headers: Dict[str, str], params: Dict
                 if attempt + 1 == max_attempts:
                     return []
                 continue
-            # Any other non-2xx should raise (caller expects [] on exception)
+
             r.raise_for_status()
             try:
                 return r.json() or []
@@ -91,18 +81,13 @@ async def get_new_burns(
     vault_address: str | None = None,
 ) -> List[Dict[str, Any]]:
     """
-    Return new *deposits* into the specified RNDR burn vault (ATA).
-    Cursor: state['last_sig'] (latest processed transaction signature).
-
-    Each returned event looks like:
-      {'signature': str, 'ts': int, 'amount': float, 'price_usd': Optional[float]}
+    Return new *deposits* into the configured RNDR burn vault.
+    Cursor: state['last_sig'].
     """
-    # 1) API key (prefer env or cfg)
     api_key = (getattr(cfg, "HELIUS_API_KEY", "") or os.environ.get("HELIUS_API_KEY", "")).strip()
     if not api_key:
         return []
 
-    # 2) Which vault address to monitor
     addr = (
         (burn_addr or "").strip()
         or (vault_address or "").strip()
@@ -112,14 +97,12 @@ async def get_new_burns(
     if not addr:
         return []
 
-    # 3) Request newest transactions for that address
     url = f"https://api.helius.xyz/v0/addresses/{addr}/transactions"
     headers = {"x-api-key": api_key}
-    params = {"limit": 100}
+    params = {"limit": 100, "api-key": api_key}  # pass both for compatibility
 
     txs = await _get_json_with_backoff(url, headers, params)
     if not isinstance(txs, list):
-        # If Helius responded with some unexpected payload or we exhausted retries
         return []
 
     last_sig = state.get("last_sig")
@@ -129,39 +112,27 @@ async def get_new_burns(
         sig = tx.get("signature")
         if not sig:
             continue
-        # Stop when we reach the last processed tx
         if last_sig and sig == last_sig:
             break
 
         ts = int(tx.get("timestamp") or tx.get("blockTime") or 0)
 
-        # Helius can nest transfers differently depending on endpoint/version
+        # token transfers can be present in different fields
         transfers = tx.get("tokenTransfers") or []
         if not transfers:
             ev = tx.get("events") or {}
             transfers = ev.get("tokenTransfers") or []
 
         for tr in transfers:
-            # Count inbound token transfers specifically to *this* vault
             to_acct = (tr.get("toUserAccount") or tr.get("to") or "").strip()
             if to_acct != addr:
                 continue
-
             amount = _extract_amount(tr)
             if amount <= 0:
                 continue
+            events.append({"signature": sig, "ts": ts, "amount": amount})
 
-            events.append(
-                {
-                    "signature": sig,
-                    "ts": ts,
-                    "amount": amount,
-                    # Set price later (only once) to avoid extra HTTP call if no events
-                    # We'll attach a price below after we know we have events.
-                }
-            )
-
-    # Advance the cursor to the newest signature (top of list) so we don't re-alert
+    # Advance the cursor to newest signature so we don't re-alert
     if txs:
         newest = txs[0].get("signature")
         if newest:
@@ -170,7 +141,6 @@ async def get_new_burns(
     if not events:
         return []
 
-    # Fetch price once only if we have events
     price_usd = await _get_price_usd(getattr(cfg, "COINGECKO_ID", "render-token"))
     if price_usd > 0:
         for ev in events:
@@ -185,9 +155,6 @@ def format_burn(
     ev: Dict[str, Any],
     totals: Tuple[Tuple[float, float], Tuple[float, float], Tuple[float, float]],
 ) -> str:
-    """
-    totals: ((a24,u24),(a7,u7),(a30,u30))
-    """
     amt = float(ev["amount"])
     p = float(ev.get("price_usd") or 0.0)
     usd = amt * p if p else 0.0
