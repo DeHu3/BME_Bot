@@ -9,13 +9,14 @@ BTN_ENABLE  = "Enable burn alerts 🔥"
 BTN_DISABLE = "Disable burn alerts 🔕"
 
 def _kb(on: bool) -> ReplyKeyboardMarkup:
-    # Single toggle button, no extra clutter
     return ReplyKeyboardMarkup([[BTN_DISABLE if on else BTN_ENABLE]], resize_keyboard=True)
 
-async def _is_burn_sub(chat_id: int) -> bool:
-    db = SubscriberDB()
+def _db(cfg) -> SubscriberDB:
+    return SubscriberDB(cfg.DATABASE_URL)
+
+async def _is_burn_sub(chat_id: int, cfg) -> bool:
     try:
-        subs = await db.get_subs("burn_subs")
+        subs = await _db(cfg).get_subs("burn_subs")
         return chat_id in subs
     except Exception:
         logging.exception("is_burn_sub failed")
@@ -25,7 +26,7 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE, cfg, sta
     if not update.message:
         return
     chat_id = update.effective_chat.id
-    on = await _is_burn_sub(chat_id)
+    on = await _is_burn_sub(chat_id, cfg)
     await update.message.reply_text(
         "🔥 BME Bot\n\nTap the button below to enable or disable RENDER burn alerts.",
         reply_markup=_kb(on),
@@ -37,18 +38,14 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE, cfg, s
         return
     chat_id = update.effective_chat.id
     text = (update.message.text or "").strip()
-
-    db = SubscriberDB()
+    db = _db(cfg)
 
     if text == BTN_ENABLE:
         try:
-            await db.add_sub("burn_subs", chat_id)
-        except AttributeError:
-            # fallback if your DB helper uses a different name
-            try:
+            if hasattr(db, "add_sub"):
+                await db.add_sub("burn_subs", chat_id)
+            elif hasattr(db, "subscribe"):
                 await db.subscribe("burn_subs", chat_id)
-            except Exception:
-                logging.exception("No add_sub/subscribe on DB")
         except Exception:
             logging.exception("enable failed")
         await update.message.reply_text("✅ Burn alerts enabled.", reply_markup=_kb(True))
@@ -56,19 +53,16 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE, cfg, s
 
     if text == BTN_DISABLE:
         try:
-            await db.discard_sub("burn_subs", chat_id)
-        except AttributeError:
-            try:
+            if hasattr(db, "discard_sub"):
+                await db.discard_sub("burn_subs", chat_id)
+            elif hasattr(db, "remove_sub"):
                 await db.remove_sub("burn_subs", chat_id)
-            except Exception:
-                logging.exception("No discard_sub/remove_sub on DB")
         except Exception:
             logging.exception("disable failed")
         await update.message.reply_text("🚫 Burn alerts disabled.", reply_markup=_kb(False))
         return
 
-    # Any other text: just re‑show the correct toggle button
-    on = await _is_burn_sub(chat_id)
+    on = await _is_burn_sub(chat_id, cfg)
     await update.message.reply_text(
         "Use the button below to toggle burn alerts.",
         reply_markup=_kb(on),
