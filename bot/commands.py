@@ -1,75 +1,76 @@
 # bot/commands.py
 from __future__ import annotations
 import logging
-from typing import Optional
-from telegram import Update
+from telegram import Update, ReplyKeyboardMarkup
 from telegram.ext import ContextTypes
+from bot.db import SubscriberDB
 
-log = logging.getLogger(__name__)
-BURN_LIST = "burn_subs"  # topic name used across app
+BTN_ENABLE  = "Enable burn alerts 🔥"
+BTN_DISABLE = "Disable burn alerts 🔕"
 
-def _chat_id(update: Update) -> Optional[int]:
-    return update.effective_chat.id if update.effective_chat else None
+def _kb(on: bool) -> ReplyKeyboardMarkup:
+    # Single toggle button, no extra clutter
+    return ReplyKeyboardMarkup([[BTN_DISABLE if on else BTN_ENABLE]], resize_keyboard=True)
 
-HELP_TEXT = (
-    "🔥 *BME Bot*\n\n"
-    "I notify you about burn events.\n\n"
-    "*Commands*\n"
-    "• /start — Subscribe to burn alerts\n"
-    "• /help — Show help\n"
-    "• `status` — Show your subscription status\n"
-    "• `stop` / `unsubscribe` — Unsubscribe\n"
-)
+async def _is_burn_sub(chat_id: int) -> bool:
+    db = SubscriberDB()
+    try:
+        subs = await db.get_subs("burn_subs")
+        return chat_id in subs
+    except Exception:
+        logging.exception("is_burn_sub failed")
+        return False
 
-async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE, cfg=None, _extra=None) -> None:
-    from bot.db import SubscriberDB
-    from bot.config import load_settings
-    chat_id = _chat_id(update)
-    if chat_id is None:
+async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE, cfg, state):
+    if not update.message:
         return
-    db = SubscriberDB(load_settings().DATABASE_URL)
-    await db.add_sub(BURN_LIST, chat_id)
-    await context.bot.send_message(chat_id, "✅ Subscribed to 🔥 burn alerts.\n\n" + HELP_TEXT, parse_mode="Markdown")
+    chat_id = update.effective_chat.id
+    on = await _is_burn_sub(chat_id)
+    await update.message.reply_text(
+        "🔥 BME Bot\n\nTap the button below to enable or disable RENDER burn alerts.",
+        reply_markup=_kb(on),
+        disable_web_page_preview=True,
+    )
 
-async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE, cfg=None, _extra=None) -> None:
-    chat_id = _chat_id(update)
-    if chat_id is None:
+async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE, cfg, state):
+    if not update.message:
         return
-    await context.bot.send_message(chat_id, HELP_TEXT, parse_mode="Markdown")
+    chat_id = update.effective_chat.id
+    text = (update.message.text or "").strip()
 
-async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE, cfg=None, _extra=None) -> None:
-    from bot.db import SubscriberDB
-    from bot.config import load_settings
-    chat_id = _chat_id(update)
-    if chat_id is None or not update.effective_message or not update.effective_message.text:
-        return
+    db = SubscriberDB()
 
-    db = SubscriberDB(load_settings().DATABASE_URL)
-    text = update.effective_message.text.strip().lower()
-
-    if text in {"stop", "/stop", "unsubscribe"}:
-        await db.remove_sub(BURN_LIST, chat_id)
-        await context.bot.send_message(chat_id, "🛑 Unsubscribed. Send /start to subscribe again.")
-        return
-
-    if text in {"status", "/status"}:
+    if text == BTN_ENABLE:
         try:
-            subs = set(await db.get_subs(BURN_LIST))
-            is_sub = chat_id in subs
-            await context.bot.send_message(
-                chat_id,
-                "📡 Status: *Subscribed* ✅" if is_sub else "📡 Status: *Not subscribed* ❌",
-                parse_mode="Markdown",
-            )
+            await db.add_sub("burn_subs", chat_id)
+        except AttributeError:
+            # fallback if your DB helper uses a different name
+            try:
+                await db.subscribe("burn_subs", chat_id)
+            except Exception:
+                logging.exception("No add_sub/subscribe on DB")
         except Exception:
-            log.exception("status failed chat_id=%s", chat_id)
-            await context.bot.send_message(chat_id, "⚠️ Couldn’t fetch status.")
+            logging.exception("enable failed")
+        await update.message.reply_text("✅ Burn alerts enabled.", reply_markup=_kb(True))
         return
 
-    if text in {"subscribe", "start"}:
-        await db.add_sub(BURN_LIST, chat_id)
-        await context.bot.send_message(chat_id, "✅ Subscribed to 🔥 burn alerts.")
+    if text == BTN_DISABLE:
+        try:
+            await db.discard_sub("burn_subs", chat_id)
+        except AttributeError:
+            try:
+                await db.remove_sub("burn_subs", chat_id)
+            except Exception:
+                logging.exception("No discard_sub/remove_sub on DB")
+        except Exception:
+            logging.exception("disable failed")
+        await update.message.reply_text("🚫 Burn alerts disabled.", reply_markup=_kb(False))
         return
 
-    # Fallback: show help
-    await context.bot.send_message(chat_id, HELP_TEXT, parse_mode="Markdown")
+    # Any other text: just re‑show the correct toggle button
+    on = await _is_burn_sub(chat_id)
+    await update.message.reply_text(
+        "Use the button below to toggle burn alerts.",
+        reply_markup=_kb(on),
+        disable_web_page_preview=True,
+    )
