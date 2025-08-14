@@ -2,6 +2,7 @@
 import os
 import logging
 from aiohttp import web
+from telegram import Update
 from telegram.ext import Application, CommandHandler, MessageHandler, filters
 
 from bot.config import load_settings
@@ -9,12 +10,25 @@ from bot.commands import cmd_start, cmd_help, handle_text
 from bot.db import SubscriberDB
 from bot import sources
 
-logging.basicConfig(level=logging.INFO)
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s:%(name)s:%(message)s")
 log = logging.getLogger("webhook_app")
 
 
+# --------- BOT HANDLERS / BUILD PTB APP ----------
+def build_ptb_application(cfg: object) -> Application:
+    app = Application.builder().token(cfg.TELEGRAM_BOT_TOKEN).build()
+    # Commands
+    app.add_handler(CommandHandler("start", lambda u, c: cmd_start(u, c, cfg, {})))
+    app.add_handler(CommandHandler("help",  lambda u, c: cmd_help(u, c, cfg)))
+    # Text
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND,
+                                   lambda u, c: handle_text(u, c, cfg, {})))
+    return app
+
+
+# --------- BURN JOB (HTTP CRON TRIGGER USES THIS) ----------
 async def run_burn_once(bot, cfg):
-    """Pull new burns and notify subscribers."""
+    """Pull new burns since last cursor and notify all 'burn_subs'."""
     db = SubscriberDB()
     state = await db.get_state("burn")
     events = await sources.get_new_burns(cfg, state)
@@ -39,116 +53,99 @@ async def run_burn_once(bot, cfg):
             try:
                 await bot.send_message(chat_id, text, disable_web_page_preview=True)
             except Exception:
-                log.exception("Failed to send burn alert to chat_id=%s", chat_id)
+                log.exception("send burn failed chat_id=%s", chat_id)
 
 
-def make_aio_app(application, cfg):
-    """Create aiohttp app used by PTB, add /healthz and /cron/burn routes."""
-    aio = web.Application()
+# --------- AIOHTTP ROUTES ----------
+async def handle_healthz(_request: web.Request) -> web.Response:
+    return web.Response(text="ok")
 
-    async def healthz(_request):
-        return web.Response(text="ok")
-
-    async def cron_burn(request: web.Request):
-        expected = (os.environ.get("CRON_SECRET") or "").strip()
-        received = (request.query.get("secret") or "").strip()
-        if expected and expected and received != expected:
-            return web.Response(status=401, text="unauthorized")
-        try:
-            await run_burn_once(application.bot, cfg)
-            return web.Response(text="ok")
-        except Exception:
-            log.exception("cron burn failed")
-            return web.Response(status=500, text="error")
-
-    aio.add_routes([
-        web.get("/healthz", healthz),
-        web.get("/cron/burn", cron_burn),
-    ])
-    # Keep refs if you need them later
-    aio["application"] = application
-    aio["cfg"] = cfg
-    return aio
-
-
-async def _post_init(app: Application, cfg):
-    """Run once after HTTP server is ready. Only set the Telegram webhook."""
-    webhook_url = cfg.WEBHOOK_URL.rstrip("/") + cfg.WEBHOOK_PATH
-    secret = (cfg.TELEGRAM_WEBHOOK_SECRET or "").strip() or None
+async def handle_cron_burn(request: web.Request) -> web.Response:
+    cfg = request.app["cfg"]
+    # Accept CRON_SECRET from env or cfg (both should match what you put in Render)
+    expected = (os.environ.get("CRON_SECRET") or getattr(cfg, "CRON_SECRET", "") or "").strip()
+    received = (request.query.get("secret") or "").strip()
+    if expected and received != expected:
+        return web.Response(status=403, text="forbidden")
     try:
-        await app.bot.set_webhook(
-            url=webhook_url,
-            secret_token=secret,
-            drop_pending_updates=True,
-        )
-        log.info("Webhook set: %s", webhook_url)
+        await run_burn_once(request.app["ptb"].bot, cfg)
+        return web.Response(text="ok")
     except Exception:
-        log.exception("set_webhook failed")
+        log.exception("cron burn failed")
+        return web.Response(status=500, text="error")
+
+async def handle_telegram_webhook(request: web.Request) -> web.Response:
+    cfg = request.app["cfg"]
+    ptb: Application = request.app["ptb"]
+
+    # Verify Telegram secret header if configured
+    secret_hdr = request.headers.get("X-Telegram-Bot-Api-Secret-Token")
+    if getattr(cfg, "TELEGRAM_WEBHOOK_SECRET", "") and secret_hdr != cfg.TELEGRAM_WEBHOOK_SECRET:
+        log.warning("Webhook secret mismatch")
+        return web.Response(status=403, text="forbidden")
+
+    try:
+        data = await request.json()
+    except Exception:
+        return web.Response(status=400, text="bad json")
+
+    update = Update.de_json(data, ptb.bot)
+    await ptb.process_update(update)
+    return web.Response(text="ok")
 
 
-def build_application(cfg):
-    application = Application.builder().token(cfg.TELEGRAM_BOT_TOKEN).build()
+# --------- STARTUP / CLEANUP ----------
+async def on_startup(app: web.Application) -> None:
+    cfg = app["cfg"]
+    ptb: Application = app["ptb"]
 
-    # Register command & message handlers
-    application.add_handler(CommandHandler("start", lambda u, c: cmd_start(u, c, cfg, {})))
-    application.add_handler(CommandHandler("help", lambda u, c: cmd_help(u, c, cfg)))
-    application.add_handler(
-        MessageHandler(filters.TEXT & ~filters.COMMAND, lambda u, c: handle_text(u, c, cfg, {}))
+    # Start PTB
+    await ptb.initialize()
+    await ptb.start()
+
+    # Build full webhook URL robustly (exactly one slash)
+    hook_url = f"{cfg.WEBHOOK_URL.rstrip('/')}/{cfg.WEBHOOK_PATH.lstrip('/')}"
+    log.info("Setting webhook_url=%s", hook_url)
+    await ptb.bot.set_webhook(
+        url=hook_url,
+        secret_token=(getattr(cfg, "TELEGRAM_WEBHOOK_SECRET", "") or None),
+        drop_pending_updates=True,
     )
-    return application
+
+async def on_cleanup(app: web.Application) -> None:
+    ptb: Application = app["ptb"]
+    await ptb.stop()
+    await ptb.shutdown()
 
 
-def main():
+# --------- APP FACTORY & MAIN ----------
+def build_web_app() -> web.Application:
     cfg = load_settings()
+    ptb = build_ptb_application(cfg)
 
-    port = int(os.environ.get("PORT", "10000"))  # Render provides PORT
-    path = cfg.WEBHOOK_PATH  # expect string starting with "/", e.g. "/tg"
+    app = web.Application()
+    app["cfg"] = cfg
+    app["ptb"] = ptb
 
-    application = build_application(cfg)
+    # Normalize path for the route
+    hook_path = "/" + cfg.WEBHOOK_PATH.lstrip("/")
 
-    # Provide post_init to set the Telegram webhook
-    async def _pi(app: Application):
-        await _post_init(app, cfg)
+    app.add_routes([
+        web.get("/healthz", handle_healthz),
+        web.get("/cron/burn", handle_cron_burn),
+        web.post(hook_path, handle_telegram_webhook),
+    ])
+    app.on_startup.append(on_startup)
+    app.on_cleanup.append(on_cleanup)
+    return app
 
-    application.post_init = _pi  # do not append; just set it
 
-    # Build aiohttp app so we can add /healthz and /cron/burn
-    aio_app = make_aio_app(application, cfg)
-
-    public_webhook_url = cfg.WEBHOOK_URL.rstrip("/") + path
-    log.info("Binding server on 0.0.0.0:%s path=%s", port, path)
-    log.info("Using webhook_url=%s", public_webhook_url)
-
-    def main() -> None:
-    # Load env and build the Application exactly once
-    cfg = load_settings()
-
-    # Normalize the webhook path: PTB expects *url_path* WITHOUT leading slash,
-    # but for consistency we allow WEBHOOK_PATH to be "/tg" in env.
-    path = cfg.WEBHOOK_PATH.strip()
-    if not path.startswith("/"):
-        path = "/" + path                   # ensure leading slash for the URL
-    url_path = path.lstrip("/")             # PTB expects this *without* slash
-
-    # Construct full HTTPS webhook URL (must be https for Telegram)
-    webhook_url = cfg.WEBHOOK_URL.rstrip("/") + path
-
-    # Build your Application the same way you already do above
-    application = build_application(cfg)    # keep your existing builder/handlers
-
-    logger.info("Binding server on 0.0.0.0:%s path=%s", cfg.PORT, path)
-    logger.info("Using webhook_url=%s", webhook_url)
-
-    # python-telegram-bot 20.7 valid parameters:
-    # - listen, port, url_path, webhook_url, secret_token
-    application.run_webhook(
-        listen="0.0.0.0",
-        port=cfg.PORT,
-        url_path=url_path,
-        webhook_url=webhook_url,
-        secret_token=cfg.TELEGRAM_WEBHOOK_SECRET,
-        # drop_pending_updates=True,     # optional
-    )
+def main() -> None:
+    app = build_web_app()
+    cfg = app["cfg"]
+    port = int(os.environ.get("PORT", getattr(cfg, "PORT", 10000)))
+    log.info("Binding server on 0.0.0.0:%s path=%s", port, "/" + cfg.WEBHOOK_PATH.lstrip("/"))
+    web.run_app(app, host="0.0.0.0", port=port)
 
 
 if __name__ == "__main__":
