@@ -15,81 +15,62 @@ log = logging.getLogger("webhook_app")
 
 
 # --------- BOT HANDLERS / BUILD PTB APP ----------
-def build_ptb_application(cfg: object) -> Application:
+def build_ptb_application(cfg) -> Application:
     app = Application.builder().token(cfg.TELEGRAM_BOT_TOKEN).build()
     # Commands
     app.add_handler(CommandHandler("start", lambda u, c: cmd_start(u, c, cfg, {})))
-    # Text
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND,
-                                   lambda u, c: handle_text(u, c, cfg, {})))
+    # Text (buttons)
+    app.add_handler(
+        MessageHandler(filters.TEXT & ~filters.COMMAND, lambda u, c: handle_text(u, c, cfg, {}))
+    )
     return app
 
 
-# --- replace your existing run_burn_once with this one ---
-
-from bot import sources
-
+# --------- BURN JOB (HTTP CRON TRIGGER USES THIS) ----------
 async def run_burn_once(bot, cfg):
     """
-    Pull new deposits into the burn ATA and notify subscribers.
-    We:
-      1) fetch deposits newer than state (ts/sig)
-      2) look up USD price at tx time
-      3) insert into DB
-      4) compute 24h/7d/30d aggregates
-      5) send a nicely formatted alert to all 'burn_subs'
+    Pull new deposits to the configured burn address(es) and notify 'burn_subs'.
+    Also record each burn to support 24h/7d/30d aggregations.
     """
     db = SubscriberDB(cfg.DATABASE_URL)
-    st = await db.get_state("burn_cursor")
-    last_ts = int(st.get("last_ts") or 0)
-    last_sig = st.get("last_sig") or None
 
-    events = await sources.fetch_burn_deposits(
-        cfg.HELIUS_API_KEY, last_ts=last_ts, last_sig=last_sig
-    )
+    # Load & persist state using the "burn" key (sources.py updates cursors inside it)
+    state = await db.get_state("burn")
+
+    # Get new events since the last saved cursors; sources.py handles Helius + filtering
+    events = await sources.get_new_burns(cfg, state)
+
+    # Save updated cursors/state immediately so we never replay on failures
+    await db.save_state("burn", state)
 
     if not events:
         return
 
     subs = await db.get_subs("burn_subs")
     if not subs:
-        # Still update cursor so we don't replay forever
-        newest = events[-1]
-        await db.save_state("burn_cursor", {"last_ts": newest["ts"], "last_sig": newest["signature"]})
         return
 
+    # Record each event, compute rolling sums, and send alerts
     for ev in events:
-        # Historical price near the tx time
-        price = await sources.usd_price_at(ev["ts"])
-        await db.record_burn(ev["signature"], ev["ts"], ev["amount"], price)
+        await db.record_burn(ev["signature"], ev["ts"], ev["amount"], ev.get("price_usd"))
+        totals = await db.sums_24_7_30()
+        text = sources.format_burn(ev, totals)
 
-        # Aggregates (USD are "at-time" sums because we store each deposit USD)
-        s24, s7, s30 = await db.sums_24_7_30()
-
-        text = sources.format_burn_message(
-            amount=ev["amount"],
-            usd=(price or 0.0) * ev["amount"],
-            signature=ev["signature"],
-            sum24=s24, sum7=s7, sum30=s30,
-        )
         for chat_id in subs:
             try:
-                await bot.send_message(chat_id, text, parse_mode="HTML", disable_web_page_preview=False)
+                await bot.send_message(chat_id, text, disable_web_page_preview=True)
             except Exception:
-                log.exception("Failed to send burn alert to chat_id=%s", chat_id)
-
-    # Advance the cursor to the newest processed tx
-    newest = events[-1]
-    await db.save_state("burn_cursor", {"last_ts": newest["ts"], "last_sig": newest["signature"]})
+                log.exception("send burn failed chat_id=%s", chat_id)
 
 
 # --------- AIOHTTP ROUTES ----------
 async def handle_healthz(_request: web.Request) -> web.Response:
     return web.Response(text="ok")
 
+
 async def handle_cron_burn(request: web.Request) -> web.Response:
     cfg = request.app["cfg"]
-    # Accept CRON_SECRET from env or cfg (both should match what you put in Render)
+    # Accept CRON_SECRET from env or cfg (must match your Render Cron Job)
     expected = (os.environ.get("CRON_SECRET") or getattr(cfg, "CRON_SECRET", "") or "").strip()
     received = (request.query.get("secret") or "").strip()
     if expected and received != expected:
@@ -100,6 +81,7 @@ async def handle_cron_burn(request: web.Request) -> web.Response:
     except Exception:
         log.exception("cron burn failed")
         return web.Response(status=500, text="error")
+
 
 async def handle_telegram_webhook(request: web.Request) -> web.Response:
     cfg = request.app["cfg"]
@@ -129,21 +111,25 @@ async def on_startup(app: web.Application) -> None:
     # Start PTB
     await ptb.initialize()
     await ptb.start()
-        # Make sure DB schema/tables exist
+
+    # Ensure DB schema/tables exist
     try:
         await SubscriberDB(cfg.DATABASE_URL).ensure_schema()
     except Exception:
         log.exception("ensure_schema failed")
 
-
     # Build full webhook URL robustly (exactly one slash)
     hook_url = f"{cfg.WEBHOOK_URL.rstrip('/')}/{cfg.WEBHOOK_PATH.lstrip('/')}"
     log.info("Setting webhook_url=%s", hook_url)
-    await ptb.bot.set_webhook(
-        url=hook_url,
-        secret_token=(getattr(cfg, "TELEGRAM_WEBHOOK_SECRET", "") or None),
-        drop_pending_updates=True,
-    )
+    try:
+        await ptb.bot.set_webhook(
+            url=hook_url,
+            secret_token=(getattr(cfg, "TELEGRAM_WEBHOOK_SECRET", "") or None),
+            drop_pending_updates=True,
+        )
+    except Exception:
+        log.exception("set_webhook failed")
+
 
 async def on_cleanup(app: web.Application) -> None:
     ptb: Application = app["ptb"]
@@ -160,7 +146,7 @@ def build_web_app() -> web.Application:
     app["cfg"] = cfg
     app["ptb"] = ptb
 
-    # Normalize path for the route
+    # Normalize path for the route (avoid /tg/tg)
     hook_path = "/" + cfg.WEBHOOK_PATH.lstrip("/")
 
     app.add_routes([
