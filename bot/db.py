@@ -38,6 +38,24 @@ class SubscriberDB:
                     v JSONB NOT NULL
                 );
             """)
+                    # Track each deposit (so we can aggregate in USD "at time")
+        await con.execute("""
+            CREATE TABLE IF NOT EXISTS burns(
+              signature TEXT PRIMARY KEY,
+              ts        TIMESTAMPTZ NOT NULL,
+              amount    DOUBLE PRECISION NOT NULL,
+              price_usd DOUBLE PRECISION,
+              usd       DOUBLE PRECISION
+            );
+        """)
+
+        await con.execute("""
+            CREATE TABLE IF NOT EXISTS app_state(
+              key   TEXT PRIMARY KEY,
+              value JSONB NOT NULL
+            );
+        """)
+
 
     # subscriptions
     async def add_sub(self, topic: str, chat_id: int) -> None:
@@ -62,18 +80,39 @@ class SubscriberDB:
             rows = await con.fetch("SELECT chat_id FROM subscriptions WHERE topic=$1;", topic)
         return [r["chat_id"] for r in rows]
 
-    # state (cursor)
-    async def get_state(self, key: str) -> Dict:
-        pool = await self.pool()
-        async with pool.acquire() as con:
-            row = await con.fetchrow("SELECT v FROM kv_state WHERE k=$1;", key)
-        return {} if row is None else row["v"]
+        async def get_state(self, key: str) -> dict:
+        async with self._pool.acquire() as con:
+            row = await con.fetchrow("SELECT value FROM app_state WHERE key=$1", key)
+            return dict(row["value"]) if row else {}
 
-    async def save_state(self, key: str, value: Dict) -> None:
-        pool = await self.pool()
-        async with pool.acquire() as con:
-            await con.execute(
-                "INSERT INTO kv_state(k, v) VALUES($1, $2::jsonb) "
-                "ON CONFLICT (k) DO UPDATE SET v=EXCLUDED.v;",
-                key, value
-            )
+    async def save_state(self, key: str, value: dict) -> None:
+        async with self._pool.acquire() as con:
+            await con.execute("""
+                INSERT INTO app_state(key, value)
+                VALUES($1, $2::jsonb)
+                ON CONFLICT (key) DO UPDATE SET value=EXCLUDED.value
+            """, key, value)
+
+    async def record_burn(self, signature: str, ts: int, amount: float, price_usd: float | None) -> None:
+        usd = (price_usd or 0.0) * amount
+        async with self._pool.acquire() as con:
+            await con.execute("""
+                INSERT INTO burns(signature, ts, amount, price_usd, usd)
+                VALUES($1, to_timestamp($2), $3, $4, $5)
+                ON CONFLICT (signature) DO NOTHING
+            """, signature, ts, amount, price_usd, usd)
+
+    async def sums_since(self, seconds: int) -> tuple[float, float]:
+        async with self._pool.acquire() as con:
+            row = await con.fetchrow("""
+              SELECT COALESCE(SUM(amount),0) AS a, COALESCE(SUM(usd),0) AS u
+              FROM burns
+              WHERE ts >= NOW() - make_interval(secs => $1)
+            """, seconds)
+            return float(row["a"]), float(row["u"])
+
+    async def sums_24_7_30(self) -> tuple[tuple[float,float], tuple[float,float], tuple[float,float]]:
+        s24 = await self.sums_since(24*3600)
+        s7  = await self.sums_since(7*24*3600)
+        s30 = await self.sums_since(30*24*3600)
+        return s24, s7, s30
