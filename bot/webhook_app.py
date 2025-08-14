@@ -28,7 +28,7 @@ def build_ptb_application(cfg: object) -> Application:
 # --------- BURN JOB (HTTP CRON TRIGGER USES THIS) ----------
 async def run_burn_once(bot, cfg):
     """Pull new burns since last cursor and notify all 'burn_subs'."""
-    db = SubscriberDB()
+    db = SubscriberDB(cfg.DATABASE_URL)
     state = await db.get_state("burn")
     events = await sources.get_new_burns(cfg, state)
     await db.save_state("burn", state)
@@ -101,6 +101,12 @@ async def on_startup(app: web.Application) -> None:
     # Start PTB
     await ptb.initialize()
     await ptb.start()
+        # Make sure DB schema/tables exist
+    try:
+        await SubscriberDB(cfg.DATABASE_URL).ensure_schema()
+    except Exception:
+        log.exception("ensure_schema failed")
+
 
     # Build full webhook URL robustly (exactly one slash)
     hook_url = f"{cfg.WEBHOOK_URL.rstrip('/')}/{cfg.WEBHOOK_PATH.lstrip('/')}"
