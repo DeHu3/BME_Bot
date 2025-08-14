@@ -6,7 +6,7 @@ from telegram import Update
 from telegram.ext import Application, CommandHandler, MessageHandler, filters
 
 from bot.config import load_settings
-from bot.commands import cmd_start, cmd_help, handle_text
+from bot.commands import cmd_start, handle_text
 from bot.db import SubscriberDB
 from bot import sources
 
@@ -19,7 +19,6 @@ def build_ptb_application(cfg: object) -> Application:
     app = Application.builder().token(cfg.TELEGRAM_BOT_TOKEN).build()
     # Commands
     app.add_handler(CommandHandler("start", lambda u, c: cmd_start(u, c, cfg, {})))
-    app.add_handler(CommandHandler("help",  lambda u, c: cmd_help(u, c, cfg)))
     # Text
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND,
                                    lambda u, c: handle_text(u, c, cfg, {})))
