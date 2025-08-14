@@ -37,8 +37,8 @@ async def run_burn_once(bot, cfg):
     # Load & persist state using the "burn" key (sources.py updates cursors inside it)
     state = await db.get_state("burn")
 
-    # Get new events since the last saved cursors; sources.py handles Helius + filtering
-    events = await sources.get_new_burns(cfg, state)
+    # 🔻 ONLY CHANGE MADE: pass the burn vault address explicitly
+    events = await sources.get_new_burns(cfg, state, burn_addr=cfg.BURN_VAULT_ADDRESS)
 
     # Save updated cursors/state immediately so we never replay on failures
     await db.save_state("burn", state)
