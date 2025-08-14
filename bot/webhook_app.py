@@ -118,6 +118,11 @@ async def on_startup(app: web.Application) -> None:
         await SubscriberDB(cfg.DATABASE_URL).ensure_schema()
     except Exception:
         log.exception("ensure_schema failed")
+        # Non-sensitive startup check
+        has_key = bool(getattr(cfg, "HELIUS_API_KEY", ""))
+        burn_addr = (getattr(cfg, "BURN_VAULT_ADDRESS", "") or getattr(cfg, "RENDER_BURN_ADDRESS", ""))
+        log.info("Startup env check: helius_key_present=%s burn_vault=%s", has_key, (burn_addr[:6] + "..." if burn_addr else "MISSING"))
+
 
     # Build full webhook URL robustly (exactly one slash)
     hook_url = f"{cfg.WEBHOOK_URL.rstrip('/')}/{cfg.WEBHOOK_PATH.lstrip('/')}"
