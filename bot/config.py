@@ -17,6 +17,10 @@ class Settings(BaseSettings):
     HELIUS_API_KEY: str | None = None
     HELIUS_BASE: str = "https://mainnet.helius-rpc.com"
 
+    RENDER_MINT: str                                # Solana RNDR mint (REQUIRED)
+    RENDER_BURN_ADDRESS: str                        # The burn/deposit address you want to watch (REQUIRED)
+    COINGECKO_ID: str = "render-token"              # Optional, defaults to CoinGecko's RNDR ID
+
     model_config = SettingsConfigDict(env_file=".env", extra="ignore")
 
 @lru_cache
