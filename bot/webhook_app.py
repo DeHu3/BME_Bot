@@ -38,7 +38,7 @@ async def run_burn_once(bot, cfg):
     state = await db.get_state("burn")
 
     # 🔻 ONLY CHANGE MADE: pass the burn vault address explicitly
-    events = await sources.get_new_burns(cfg, state, burn_addr=cfg.BURN_VAULT_ADDRESS)
+    events = await sources.get_new_burns(cfg, state)
 
     # Save updated cursors/state immediately so we never replay on failures
     await db.save_state("burn", state)
