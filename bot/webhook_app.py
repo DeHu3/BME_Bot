@@ -119,13 +119,35 @@ def main():
     log.info("Binding server on 0.0.0.0:%s path=%s", port, path)
     log.info("Using webhook_url=%s", public_webhook_url)
 
-    # This call blocks and keeps the process alive for Render to detect the open port
+    def main() -> None:
+    # Load env and build the Application exactly once
+    cfg = load_settings()
+
+    # Normalize the webhook path: PTB expects *url_path* WITHOUT leading slash,
+    # but for consistency we allow WEBHOOK_PATH to be "/tg" in env.
+    path = cfg.WEBHOOK_PATH.strip()
+    if not path.startswith("/"):
+        path = "/" + path                   # ensure leading slash for the URL
+    url_path = path.lstrip("/")             # PTB expects this *without* slash
+
+    # Construct full HTTPS webhook URL (must be https for Telegram)
+    webhook_url = cfg.WEBHOOK_URL.rstrip("/") + path
+
+    # Build your Application the same way you already do above
+    application = build_application(cfg)    # keep your existing builder/handlers
+
+    logger.info("Binding server on 0.0.0.0:%s path=%s", cfg.PORT, path)
+    logger.info("Using webhook_url=%s", webhook_url)
+
+    # python-telegram-bot 20.7 valid parameters:
+    # - listen, port, url_path, webhook_url, secret_token
     application.run_webhook(
         listen="0.0.0.0",
-        port=port,
-        url_path=path.lstrip("/"),  # PTB expects it without leading slash
-        webhook_url=public_webhook_url,
-        webhook_app=aio_app,
+        port=cfg.PORT,
+        url_path=url_path,
+        webhook_url=webhook_url,
+        secret_token=cfg.TELEGRAM_WEBHOOK_SECRET,
+        # drop_pending_updates=True,     # optional
     )
 
 
