@@ -1,14 +1,59 @@
 # bot/sources.py
 from __future__ import annotations
 
-from typing import List, Dict, Any, Tuple
 import os
+import time
 import asyncio
+from typing import List, Dict, Any, Tuple, Optional
+
 import httpx
 
-# ---- Price helpers ----------------------------------------------------------
 
-async def _get_price_usd(coingecko_id: str = "render-token") -> float:
+def _he_headers(cfg) -> Dict[str, str]:
+    """
+    Build Helius headers. We use header-based auth to avoid 401s.
+    """
+    key = (getattr(cfg, "HELIUS_API_KEY", None) or os.environ.get("HELIUS_API_KEY") or "").strip()
+    return {"x-api-key": key} if key else {}
+
+
+async def _get_json_with_backoff(
+    url: str,
+    headers: Dict[str, str],
+    params: Optional[Dict[str, Any]] = None,
+    tries: int = 4,
+    timeout: float = 20.0,
+) -> Any:
+    """
+    GET with simple exponential backoff for 429 responses.
+    """
+    delay = 0.8
+    last: Optional[httpx.Response] = None
+    async with httpx.AsyncClient(timeout=timeout) as client:
+        for _ in range(tries):
+            r = await client.get(url, headers=headers, params=params)
+            last = r
+            # Respect rate limiting
+            if r.status_code == 429:
+                ra = r.headers.get("retry-after")
+                wait = float(ra) if ra else delay
+                await asyncio.sleep(wait)
+                delay = min(delay * 2.0, 8.0)
+                continue
+            r.raise_for_status()
+            return r.json()
+    # If we exhausted retries, raise the last error
+    if last is not None:
+        last.raise_for_status()
+    raise RuntimeError("Helius request failed")
+
+
+async def _get_price_usd(coingecko_id: str = "render") -> float:
+    """
+    Fetch current USD price for RENDER (approximate for alert).
+    If you later want true historical-at-timestamp, we can add a
+    small range query to CoinGecko's /market_chart/range endpoint.
+    """
     url = "https://api.coingecko.com/api/v3/simple/price"
     params = {"ids": coingecko_id, "vs_currencies": "usd"}
     try:
@@ -16,159 +61,168 @@ async def _get_price_usd(coingecko_id: str = "render-token") -> float:
             r = await client.get(url, params=params)
             r.raise_for_status()
             data = r.json()
+            # default id for RENDER is "render". If you set COINGECKO_ID it will use that.
             return float(data.get(coingecko_id, {}).get("usd", 0)) or 0.0
     except Exception:
         return 0.0
 
 
-# ---- Helpers for Helius payloads -------------------------------------------
-
 def _extract_amount(transfer: Dict[str, Any]) -> float:
-    if "tokenAmount" in transfer:
+    """
+    Convert Helius token transfer amount into human units, robustly.
+    """
+    # preferred already-decimal field
+    if isinstance(transfer.get("tokenAmount"), (int, float, str)):
         try:
             return float(transfer["tokenAmount"])
         except Exception:
             pass
+
     raw = transfer.get("amount")
     dec = transfer.get("decimals")
     if isinstance(raw, int) and isinstance(dec, int) and dec > 0:
         return raw / (10 ** dec)
+
     try:
         return float(raw or 0)
     except Exception:
         return 0.0
 
 
-async def _get_json_with_backoff(url: str, headers: Dict[str, str], params: Dict[str, Any]) -> Any:
-    delay = 1.0
-    max_attempts = 4
-    async with httpx.AsyncClient(timeout=20) as client:
-        for attempt in range(max_attempts):
-            r = await client.get(url, headers=headers, params=params)
-
-            # Immediate graceful returns for auth/forbidden
-            if r.status_code in (401, 403):
-                return []
-
-            # Backoff on 429 or 5xx
-            if r.status_code == 429 or 500 <= r.status_code < 600:
-                retry_after = r.headers.get("retry-after")
-                try:
-                    wait = float(retry_after) if retry_after else delay
-                except Exception:
-                    wait = delay
-                await asyncio.sleep(wait)
-                delay = min(delay * 2, 10.0)
-                if attempt + 1 == max_attempts:
-                    return []
-                continue
-
-            r.raise_for_status()
-            try:
-                return r.json() or []
-            except Exception:
-                return []
-    return []
-
-
-# ---- Main API ---------------------------------------------------------------
-
-async def get_new_burns(
-    cfg,
-    state: dict,
-    *,
-    burn_addr: str | None = None,
-    vault_address: str | None = None,
-) -> List[Dict[str, Any]]:
+async def get_new_burns(cfg, state: dict) -> List[Dict[str, Any]]:
     """
-    Return new *deposits* into the configured RNDR burn vault.
-    Cursor: state['last_sig'].
+    Return new **BURN** events for the RENDER mint that originate from your burn vault.
+
+    Cursor: state['last_sig']  (last processed signature from the *address timeline* we poll)
+    Each returned event: {'signature','ts','amount','price_usd'}
+
+    Env/config used:
+      - HELIUS_API_KEY         (required)
+      - BURN_VAULT_ADDRESS     (preferred)  -> the owner or the token account that burns
+      - RENDER_BURN_ADDRESS    (fallback)   -> used only if BURN_VAULT_ADDRESS is not set
+      - RENDER_MINT            (optional)   -> exact mint to match; more reliable than symbol
+      - RNDR_SYMBOL            (optional)   -> default 'RENDER' if mint is not set
+      - COINGECKO_ID           (optional)   -> default 'render'
     """
-    api_key = (getattr(cfg, "HELIUS_API_KEY", "") or os.environ.get("HELIUS_API_KEY", "")).strip()
+    api_key = (getattr(cfg, "HELIUS_API_KEY", None) or os.environ.get("HELIUS_API_KEY") or "").strip()
     if not api_key:
         return []
 
-    addr = (
-        (burn_addr or "").strip()
-        or (vault_address or "").strip()
-        or (getattr(cfg, "RENDER_BURN_ADDRESS", "") or "").strip()
-        or (getattr(cfg, "BURN_VAULT_ADDRESS", "") or "").strip()
+    # Which timeline to poll from Helius
+    watch = (
+        (getattr(cfg, "BURN_VAULT_ADDRESS", None) or os.environ.get("BURN_VAULT_ADDRESS"))  # preferred
+        or (getattr(cfg, "RENDER_BURN_ADDRESS", None) or os.environ.get("RENDER_BURN_ADDRESS"))  # fallback
+        or ""
+    ).strip()
+    if not watch:
+        # nothing to poll
+        return []
+
+    render_mint = (getattr(cfg, "RENDER_MINT", None) or os.environ.get("RENDER_MINT") or "").strip() or None
+    # If no mint provided, fall back to symbol
+    symbol_pref = (
+        (getattr(cfg, "RNDR_SYMBOL", None) or os.environ.get("RNDR_SYMBOL") or "RENDER")
+        .strip()
+        .upper()
     )
-    if not addr:
-        return []
 
-    url = f"https://api.helius.xyz/v0/addresses/{addr}/transactions"
-    headers = {"x-api-key": api_key}
-    params = {"limit": 100, "api-key": api_key}  # pass both for compatibility
+    base = f"https://api.helius.xyz/v0/addresses/{watch}/transactions"
+    params = {"limit": 100}
+    headers = _he_headers(cfg)
 
-    txs = await _get_json_with_backoff(url, headers, params)
-    if not isinstance(txs, list):
-        return []
+    txs: List[Dict[str, Any]] = await _get_json_with_backoff(base, headers, params=params)
 
     last_sig = state.get("last_sig")
-    events: List[Dict[str, Any]] = []
+    new_events: List[Dict[str, Any]] = []
 
     for tx in txs:
         sig = tx.get("signature")
         if not sig:
             continue
+        # Stop once we reach the last processed signature
         if last_sig and sig == last_sig:
             break
 
-        ts = int(tx.get("timestamp") or tx.get("blockTime") or 0)
-
-        # token transfers can be present in different fields
-        transfers = tx.get("tokenTransfers") or []
-        if not transfers:
-            ev = tx.get("events") or {}
-            transfers = ev.get("tokenTransfers") or []
+        ts = int(tx.get("timestamp") or tx.get("blockTime") or int(time.time()))
+        transfers = tx.get("tokenTransfers") or (tx.get("events") or {}).get("tokenTransfers") or []
 
         for tr in transfers:
-            to_acct = (tr.get("toUserAccount") or tr.get("to") or "").strip()
-            if to_acct != addr:
+            # We only alert on **actual burns**
+            ttype = str(tr.get("type") or tr.get("transferType") or "").upper()
+            if ttype != "BURN":
                 continue
+
+            mint = (tr.get("mint") or "").strip()
+            sym = (tr.get("symbol") or tr.get("tokenSymbol") or "").strip().upper()
+
+            # Must be the RENDER mint (or symbol fallback)
+            if render_mint:
+                if mint != render_mint:
+                    continue
+            else:
+                if sym != symbol_pref:
+                    continue
+
+            # Ensure the burn **originates** from our vault (owner or token account)
+            from_acct = (
+                tr.get("fromUserAccount")
+                or tr.get("tokenAccount")
+                or tr.get("fromTokenAccount")
+                or ""
+            ).strip()
+            from_owner = (tr.get("fromUserAccountOwner") or tr.get("fromOwner") or "").strip()
+
+            if watch and (from_acct != watch and from_owner != watch):
+                # Skip burns not done by our vault
+                continue
+
             amount = _extract_amount(tr)
             if amount <= 0:
                 continue
-            events.append({"signature": sig, "ts": ts, "amount": amount})
 
-    # Advance the cursor to newest signature so we don't re-alert
+            price_usd = await _get_price_usd(getattr(cfg, "COINGECKO_ID", "render"))
+            new_events.append(
+                {
+                    "signature": sig,
+                    "ts": ts,
+                    "amount": amount,
+                    "price_usd": price_usd if price_usd > 0 else None,
+                }
+            )
+
+    # Update the cursor to the newest signature on the page so we don't re-alert
     if txs:
         newest = txs[0].get("signature")
         if newest:
             state["last_sig"] = newest
 
-    if not events:
-        return []
+    # Process oldest -> newest so aggregates increase monotonically
+    new_events.reverse()
+    return new_events
 
-    price_usd = await _get_price_usd(getattr(cfg, "COINGECKO_ID", "render-token"))
-    if price_usd > 0:
-        for ev in events:
-            ev["price_usd"] = price_usd
-
-    return events
-
-
-# ---- Formatting -------------------------------------------------------------
 
 def format_burn(
     ev: Dict[str, Any],
     totals: Tuple[Tuple[float, float], Tuple[float, float], Tuple[float, float]],
 ) -> str:
+    """
+    totals: ((a24,u24), (a7,u7), (a30,u30))
+    """
     amt = float(ev["amount"])
     p = float(ev.get("price_usd") or 0.0)
     usd = amt * p if p else 0.0
 
-    def fmt_pair(t: Tuple[float, float]) -> str:
+    def fmt_pair(t):
         a, u = t
-        return f"{a:,.2f} RNDR (${u:,.2f})"
+        return f"{a:,.2f} RENDER (${u:,.2f})"
 
     s24, s7, s30 = totals
     lines = [
-        f"🔥 {amt:,.2f} RNDR" + (f" (${usd:,.2f})" if usd else ""),
-        f"📊 24 hours: {fmt_pair(s24)}",
-        f"📊 7 days: {fmt_pair(s7)}",
-        f"📊 30 days: {fmt_pair(s30)}",
-        f"🔗 View on Solscan: https://solscan.io/tx/{ev['signature']}",
+        "🔥 RENDER burn detected",
+        f"Just now: {amt:,.2f} RENDER" + (f" (${usd:,.2f})" if usd else ""),
+        f"24h: {fmt_pair(s24)}",
+        f"7d:  {fmt_pair(s7)}",
+        f"30d: {fmt_pair(s30)}",
+        f"Tx: https://solscan.io/tx/{ev['signature']}",
     ]
     return "\n".join(lines)
