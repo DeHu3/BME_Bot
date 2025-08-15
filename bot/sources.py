@@ -186,11 +186,9 @@ async def get_new_burns(cfg, state: dict) -> List[Dict[str, Any]]:
                 }
             )
 
-    # Update cursor to newest signature if we got any txs
-    if txs:
-        newest = txs[0].get("signature")
-        if newest:
-            state["last_sig"] = newest
+    # Advance cursor ONLY if we actually found qualifying events.
+    if new_events:
+    state["last_sig"] = new_events[0]["signature"]
 
     return new_events
 
