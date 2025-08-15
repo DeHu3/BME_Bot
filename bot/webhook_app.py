@@ -71,7 +71,13 @@ async def run_burn_once(bot, cfg):
 
         for chat_id in subs:
             try:
-                await bot.send_message(chat_id, text, disable_web_page_preview=True)
+                # IMPORTANT: enable HTML so the Solscan link is clickable
+                await bot.send_message(
+                    chat_id,
+                    text,
+                    parse_mode="HTML",                 # <-- added
+                    disable_web_page_preview=True
+                )
             except Exception:
                 log.exception("send burn failed chat_id=%s", chat_id)
 
@@ -151,7 +157,12 @@ async def handle_admin_replay(request: web.Request) -> web.Response:
 
             for chat_id in subs:
                 try:
-                    await ptb.bot.send_message(chat_id, text, disable_web_page_preview=True)
+                    await ptb.bot.send_message(
+                        chat_id,
+                        text,
+                        parse_mode="HTML",             # <-- added (same reason)
+                        disable_web_page_preview=True
+                    )
                 except Exception:
                     log.exception("send burn (replay) failed chat_id=%s", chat_id)
             sent += 1
