@@ -3,19 +3,17 @@ from __future__ import annotations
 
 import asyncio
 import random
-import time
 from typing import List, Dict, Any, Tuple, Optional
 import httpx
 
 
 # ------------------------
-# Price (simple current-price; optional to upgrade to price-at-time)
+# Price (current price; simple and robust)
 # ------------------------
 async def _get_price_usd(coingecko_id: str = "render-token") -> float:
     """
-    Fetch current USD price for RENDER/RNDR. We use current price as an approximation
-    to keep things simple and robust. If you want strict 'price at burn time',
-    we can swap this later for a time-bucketed lookup.
+    Fetch current USD price for RENDER/RNDR. We use current price as an
+    approximation to keep things simple and robust.
     """
     url = "https://api.coingecko.com/api/v3/simple/price"
     params = {"ids": coingecko_id, "vs_currencies": "usd"}
@@ -30,7 +28,7 @@ async def _get_price_usd(coingecko_id: str = "render-token") -> float:
 
 
 # ------------------------
-# HTTP helpers with backoff
+# HTTP helper with backoff
 # ------------------------
 async def _get_json_with_backoff(
     url: str,
@@ -44,7 +42,7 @@ async def _get_json_with_backoff(
     If 401/403, raise immediately (bad/missing API key).
     Returns a list (Helius returns a list of txs).
     """
-    last_exc = None
+    last_exc: Optional[Exception] = None
     for attempt in range(1, max_attempts + 1):
         try:
             async with httpx.AsyncClient(timeout=20) as client:
@@ -109,7 +107,7 @@ def _is_to_burn_vault(tr: Dict[str, Any], burn_vault: str) -> bool:
     NOTE: Because an SPL token account is tied to a single mint, we do NOT need
     to check symbol/mint if we trust the ATA.
     """
-    burn_vault = burn_vault.strip()
+    burn_vault = (burn_vault or "").strip()
     if not burn_vault:
         return False
 
@@ -130,57 +128,41 @@ def _is_to_burn_vault(tr: Dict[str, Any], burn_vault: str) -> bool:
 async def get_new_burns(cfg, state: dict) -> List[Dict[str, Any]]:
     """
     Return new *deposit* events into the burn vault ATA (most frequent signal).
+    Strict rollback version: uses ONLY a signature cursor (state['last_sig']).
+    We stop exactly when we hit the last processed signature.
 
-    Cursors in `state` (mutated in-place):
-      - state['last_sig']: latest processed transaction signature (string)
-      - state['last_ts'] : unix timestamp (int) of the newest processed *event* we recorded
+    Each returned event is one per transaction (we sum all qualifying transfers
+    within the tx), so DB dedupe by signature never loses value.
 
-    This function implements a *time-overlap* to survive indexing delays:
-      - We do NOT stop immediately at last_sig; we scan at least MIN_PAGES
-      - We stop once we've covered OVERLAP seconds *before* last_ts (or reached MAX_PAGES)
-      - We still dedupe by signature and report at most one event per transaction
-
-    Returned event shape (one per tx):
+    Returned event shape:
       {'signature': str, 'ts': int, 'amount': float, 'price_usd': Optional[float]}
     """
     api_key = (getattr(cfg, "HELIUS_API_KEY", "") or "").strip()
     if not api_key:
         return []
 
-    # Allow either var name; prefer BURN_VAULT_ADDRESS if present
     burn_vault = (
-        (getattr(cfg, "BURN_VAULT_ADDRESS", "") or getattr(cfg, "RENDER_BURN_ADDRESS", "") or "")
-        .strip()
-    )
+        getattr(cfg, "BURN_VAULT_ADDRESS", "")
+        or getattr(cfg, "RENDER_BURN_ADDRESS", "")
+        or ""
+    ).strip()
     if not burn_vault:
         return []
-
-    # Tunables (optional env). Defaults chosen to be safe & light.
-    overlap_sec = int(getattr(cfg, "BURN_SCAN_OVERLAP_SEC", 180) or 180)      # re-scan last 3 min
-    min_pages   = int(getattr(cfg, "BURN_SCAN_MIN_PAGES", 2) or 2)            # scan at least 2 pages
-    max_pages   = int(getattr(cfg, "BURN_SCAN_MAX_PAGES", 5) or 5)            # never scan more than 5
-
-    last_sig: Optional[str] = state.get("last_sig") or None
-    last_ts_val: int = int(state.get("last_ts") or 0)
-
-    # For the very first run there may be no last_ts. We'll still page normally.
-    cutoff_ts: Optional[int] = None
-    if last_ts_val > 0 and overlap_sec > 0:
-        cutoff_ts = max(0, last_ts_val - overlap_sec)
 
     base = f"https://api.helius.xyz/v0/addresses/{burn_vault}/transactions"
     common_params = {"api-key": api_key, "limit": 100}
 
-    pages = 0
+    last_sig: Optional[str] = state.get("last_sig") or None
     before: Optional[str] = None
-    found_last_sig = False
-    newest_seen_sig: Optional[str] = None
-    newest_event_ts: int = 0
+    pages = 0
+    max_pages = 3
+    found_cursor = False
 
-    # Use current price once per run (approx. "at time" value)
+    # One price fetch per run (simple approximation)
     price_usd = await _get_price_usd(getattr(cfg, "COINGECKO_ID", "render-token"))
 
     events_by_sig: Dict[str, Dict[str, Any]] = {}
+    newest_seen_sig: Optional[str] = None
 
     while pages < max_pages:
         params = dict(common_params)
@@ -188,31 +170,26 @@ async def get_new_burns(cfg, state: dict) -> List[Dict[str, Any]]:
             params["before"] = before
 
         txs: List[Dict[str, Any]] = await _get_json_with_backoff(base, params=params)
+
         if not txs:
             break
 
-        # Track the oldest ts we saw on this page to decide early stop
-        page_oldest_ts: Optional[int] = None
-
-        for idx, tx in enumerate(txs):
+        for tx in txs:
             sig = tx.get("signature")
             if not isinstance(sig, str):
                 continue
 
-            if pages == 0 and idx == 0:
-                # Remember the top-most signature we saw this run
+            # Remember the topmost signature on the very first tx we see
+            if newest_seen_sig is None:
                 newest_seen_sig = sig
 
-            ts = int(tx.get("timestamp") or tx.get("blockTime") or 0)
-            if page_oldest_ts is None or (ts and ts < page_oldest_ts):
-                page_oldest_ts = ts
-
+            # Stop at the saved cursor (strict rollback behaviour)
             if last_sig and sig == last_sig:
-                # Don't stop immediately; finish this page and then decide based on overlap/page budget
-                found_last_sig = True
-                continue
+                found_cursor = True
+                break
 
-            # Helius can place transfers in different fields depending on version
+            ts = int(tx.get("timestamp") or tx.get("blockTime") or 0)
+
             transfers = tx.get("tokenTransfers") or []
             if not transfers:
                 ev = tx.get("events") or {}
@@ -233,37 +210,21 @@ async def get_new_burns(cfg, state: dict) -> List[Dict[str, Any]]:
                     "amount": total_amount,
                     "price_usd": price_usd if price_usd > 0 else None,
                 }
-                if ts > newest_event_ts:
-                    newest_event_ts = ts
 
-        pages += 1
-
-        # Decide whether we've covered enough to stop
-        # Stop if:
-        #  - we saw last_sig somewhere already, AND
-        #  - we have scanned at least min_pages, AND
-        #  - either we have no cutoff (first run) OR this page's oldest ts is at/older than the cutoff
-        if found_last_sig and pages >= min_pages:
-            if cutoff_ts is None or (page_oldest_ts is not None and page_oldest_ts <= cutoff_ts):
-                break
-
-        # If this page returned fewer than limit, we're at the end
-        if len(txs) < common_params["limit"]:
+        if found_cursor:
             break
 
+        # paginate
         before = txs[-1].get("signature") or before
+        pages += 1
 
-    # Build final list (ascending by time so older alerts go first)
+    # Deterministic order for /admin/replay?n=
     new_events = list(events_by_sig.values())
-    new_events.sort(key=lambda e: e["ts"])
+    new_events.sort(key=lambda e: (e["ts"], e["signature"]))
 
-    # Update cursors:
-    # - Always advance last_sig to newest seen this run (we compensate with overlap next time).
-    # - Only update last_ts if we actually found any qualifying events (to avoid shrinking the overlap window unnecessarily).
-    if newest_seen_sig:
+    # Advance cursor ONLY if we actually found qualifying events
+    if new_events and newest_seen_sig:
         state["last_sig"] = newest_seen_sig
-    if newest_event_ts > 0:
-        state["last_ts"] = newest_event_ts
 
     return new_events
 
