@@ -38,7 +38,7 @@ async def run_burn_once(bot, cfg):
     # Load & persist state using the "burn" key (sources.py updates cursors inside it)
     state = await db.get_state("burn")
 
-    # 🔻 ONLY CHANGE MADE: pass the burn vault address explicitly
+    # Get new events since the last saved cursors; sources.py handles Helius + filtering
     events = await sources.get_new_burns(cfg, state)
 
     # Save updated cursors/state immediately so we never replay on failures
@@ -84,6 +84,67 @@ async def handle_cron_burn(request: web.Request) -> web.Response:
         return web.Response(status=500, text="error")
 
 
+async def handle_admin_replay(request: web.Request) -> web.Response:
+    """
+    GET /admin/replay?n=5&secret=...
+    Manually send alerts for the most-recent N burn deposits.
+
+    - Uses same logic as cron (sources.get_new_burns) with a *temporary* state,
+      so it does not advance your persisted cursor.
+    - Dedupes with burns.signature PK, so it's safe to replay.
+    - Clamps N to 1..50 to avoid spam.
+    """
+    cfg = request.app["cfg"]
+    expected = (os.environ.get("CRON_SECRET") or getattr(cfg, "CRON_SECRET", "") or "").strip()
+    received = (request.query.get("secret") or "").strip()
+    if expected and received != expected:
+        return web.Response(status=403, text="forbidden")
+
+    # how many to send
+    try:
+        n = int(request.query.get("n", "5"))
+    except ValueError:
+        n = 5
+    n = max(1, min(n, 50))  # clamp to 1..50
+
+    db = SubscriberDB(cfg.DATABASE_URL)
+    subs = await db.get_subs("burn_subs")
+    if not subs:
+        return web.Response(text="no subscribers")
+
+    # Pull the latest page of events WITHOUT advancing saved state
+    tmp_state = {}
+    try:
+        page_events = await sources.get_new_burns(cfg, tmp_state)
+    except Exception:
+        log.exception("admin replay: get_new_burns failed")
+        return web.Response(status=500, text="fetch failed")
+
+    if not page_events:
+        return web.Response(text="no recent burns")
+
+    # We want N most recent; send oldest->newest for nicer reading
+    events = page_events[:n]
+    sent = 0
+    for ev in reversed(events):
+        try:
+            await db.record_burn(ev["signature"], ev["ts"], ev["amount"], ev.get("price_usd"))
+            totals = await db.sums_24_7_30()
+            text = sources.format_burn(ev, totals)
+            for chat_id in subs:
+                try:
+                    await request.app["ptb"].bot.send_message(
+                        chat_id, text, disable_web_page_preview=True
+                    )
+                except Exception:
+                    log.exception("admin replay: send failed chat_id=%s", chat_id)
+            sent += 1
+        except Exception:
+            log.exception("admin replay: record/send failed for sig=%s", ev.get("signature"))
+
+    return web.Response(text=f"ok: sent {sent} alert(s)")
+
+
 async def handle_telegram_webhook(request: web.Request) -> web.Response:
     cfg = request.app["cfg"]
     ptb: Application = request.app["ptb"]
@@ -121,8 +182,8 @@ async def on_startup(app: web.Application) -> None:
         # Non-sensitive startup check
         has_key = bool(getattr(cfg, "HELIUS_API_KEY", ""))
         burn_addr = (getattr(cfg, "BURN_VAULT_ADDRESS", "") or getattr(cfg, "RENDER_BURN_ADDRESS", ""))
-        log.info("Startup env check: helius_key_present=%s burn_vault=%s", has_key, (burn_addr[:6] + "..." if burn_addr else "MISSING"))
-
+        log.info("Startup env check: helius_key_present=%s burn_vault=%s",
+                 has_key, (burn_addr[:6] + "..." if burn_addr else "MISSING"))
 
     # Build full webhook URL robustly (exactly one slash)
     hook_url = f"{cfg.WEBHOOK_URL.rstrip('/')}/{cfg.WEBHOOK_PATH.lstrip('/')}"
@@ -159,6 +220,8 @@ def build_web_app() -> web.Application:
         web.get("/healthz", handle_healthz),
         web.get("/cron/burn", handle_cron_burn),
         web.post(hook_path, handle_telegram_webhook),
+        # New manual replay endpoint:
+        web.get("/admin/replay", handle_admin_replay),
     ])
     app.on_startup.append(on_startup)
     app.on_cleanup.append(on_cleanup)
