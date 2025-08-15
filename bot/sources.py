@@ -1,3 +1,4 @@
+# bot/sources.py
 from __future__ import annotations
 
 import asyncio
@@ -7,11 +8,13 @@ import httpx
 
 
 # ------------------------
-# Price (historical; falls back to current price)
+# Price (simple current-price; optional to upgrade to price-at-time)
 # ------------------------
 async def _get_price_usd(coingecko_id: str = "render-token") -> float:
     """
-    Fallback: current USD price for RENDER/RNDR.
+    Fetch current USD price for RENDER/RNDR. We use current price as an approximation
+    to keep things simple and robust. If you want strict 'price at burn time',
+    we can swap this later for a time-bucketed lookup.
     """
     url = "https://api.coingecko.com/api/v3/simple/price"
     params = {"ids": coingecko_id, "vs_currencies": "usd"}
@@ -23,33 +26,6 @@ async def _get_price_usd(coingecko_id: str = "render-token") -> float:
             return float(data.get(coingecko_id, {}).get("usd", 0)) or 0.0
     except Exception:
         return 0.0
-
-
-async def usd_price_at(ts_unix: int, coingecko_id: str = "render-token") -> float:
-    """
-    Historical USD price for the given unix timestamp using CoinGecko's
-    market_chart/range endpoint. If the range returns nothing, fall back to
-    current price via _get_price_usd.
-    """
-    # Use a narrow window around the tx time (±8 minutes)
-    start = max(0, ts_unix - 8 * 60)
-    end = ts_unix + 8 * 60
-    url = f"https://api.coingecko.com/api/v3/coins/{coingecko_id}/market_chart/range"
-    params = {"vs_currency": "usd", "from": str(start), "to": str(end)}
-    try:
-        async with httpx.AsyncClient(timeout=12) as client:
-            r = await client.get(url, params=params)
-            r.raise_for_status()
-            data = r.json() or {}
-            prices = data.get("prices") or []  # list of [ms, price]
-            if prices:
-                target_ms = ts_unix * 1000
-                best = min(prices, key=lambda p: abs(int(p[0]) - target_ms))
-                return float(best[1])
-    except Exception:
-        pass
-    # Fallback to spot if no datapoint was returned or request failed
-    return await _get_price_usd(coingecko_id)
 
 
 # ------------------------
@@ -127,24 +103,39 @@ def _extract_amount(tr: Dict[str, Any]) -> float:
 
 def _is_to_burn_vault(tr: Dict[str, Any], burn_vault: str) -> bool:
     """
-    True if the transfer's destination token account equals the burn deposit ATA.
+    True if the transfer goes either:
+      - directly to the burn deposit token account (ATA), OR
+      - to the owner wallet that holds that ATA.
     We check multiple possible field names across Helius versions.
-    NOTE: Because an SPL token account is tied to a single mint, we do NOT need
-    to check symbol/mint if we trust the ATA.
     """
-    burn_vault = burn_vault.strip()
+    burn_vault = (burn_vault or "").strip()
     if not burn_vault:
         return False
 
-    for c in (
+    # Destination token account fields
+    candidates = [
         tr.get("toUserAccount"),
         tr.get("toTokenAccount"),
         tr.get("to"),
         tr.get("destination"),
-    ):
+        # Destination *owner wallet* fields (common on Helius)
+        tr.get("toUserAccountOwner"),
+        tr.get("toOwner"),
+    ]
+    for c in candidates:
         if isinstance(c, str) and c.strip() == burn_vault:
             return True
     return False
+
+
+def _is_render_symbol_ok(tr: Dict[str, Any], cfg) -> bool:
+    """
+    If Helius gives us a symbol, ensure it's the one we expect (default 'RENDER').
+    If no symbol is present, allow it (ATA is already a strong filter).
+    """
+    wanted = (getattr(cfg, "RNDR_SYMBOL", "RENDER") or "RENDER").upper()
+    sym = (tr.get("symbol") or tr.get("tokenSymbol") or "").upper()
+    return (not sym) or (sym == wanted)
 
 
 # ------------------------
@@ -152,7 +143,7 @@ def _is_to_burn_vault(tr: Dict[str, Any], burn_vault: str) -> bool:
 # ------------------------
 async def get_new_burns(cfg, state: dict) -> List[Dict[str, Any]]:
     """
-    Return new *deposit* events into the burn vault ATA (most frequent signal).
+    Return new *deposit* events into the burn vault (owner or ATA), whichever you configured.
     Cursor: state['last_sig'] (latest processed tx signature).
     Each event is one per transaction (we *sum* all qualifying transfers within the tx)
     so DB dedup by signature never loses value.
@@ -176,6 +167,8 @@ async def get_new_burns(cfg, state: dict) -> List[Dict[str, Any]]:
     pages = 0
     max_pages = 5
     found_last = False
+
+    price_usd = await _get_price_usd(getattr(cfg, "COINGECKO_ID", "render-token"))
 
     events_by_sig: Dict[str, Dict[str, Any]] = {}
     newest_seen_sig: Optional[str] = None
@@ -211,22 +204,21 @@ async def get_new_burns(cfg, state: dict) -> List[Dict[str, Any]]:
 
             total_amount = 0.0
             for tr in transfers:
+                # ---- minimal fixes: accept owner OR ATA and guard by symbol if present
                 if not _is_to_burn_vault(tr, burn_vault):
+                    continue
+                if not _is_render_symbol_ok(tr, cfg):
                     continue
                 amt = _extract_amount(tr)
                 if amt > 0:
                     total_amount += amt
 
             if total_amount > 0:
-                # 🔹 price at the transaction time (fallbacks internally if needed)
-                cg_id = getattr(cfg, "COINGECKO_ID", "render-token")
-                price = await usd_price_at(ts, cg_id)
-
                 events_by_sig[sig] = {
                     "signature": sig,
                     "ts": ts,
                     "amount": total_amount,
-                    "price_usd": price if price > 0 else None,
+                    "price_usd": price_usd if price_usd > 0 else None,
                 }
 
         if found_last:
@@ -268,7 +260,7 @@ def format_burn(
 
     lines = [
         f"🔥  {amt:,.2f} RENDER (${usd:,.2f})",
-        "",  # blank line
+        "",
         f"📊 24 hours: {fmt_pair(s24)}",
         f"📊 7 days: {fmt_pair(s7)}",
         f"📊 30 days: {fmt_pair(s30)}",
