@@ -238,12 +238,15 @@ def format_burn(
         return f"{a:,.2f} RENDER (${u:,.2f})"
 
     s24, s7, s30 = totals
+    sig = ev["signature"]
+
     lines = [
-        "🔥 RENDER burn deposit detected",
-        f"Just now: {amt:,.2f} RENDER" + (f" (${usd:,.2f})" if usd else ""),
-        f"24h: {fmt_pair(s24)}",
-        f"7d: {fmt_pair(s7)}",
-        f"30d: {fmt_pair(s30)}",
-        f"Tx: https://solscan.io/tx/{ev['signature']}",
+        f"🔥  {amt:,.2f} RENDER (${usd:,.2f})",
+        "",  # blank line
+        f"📊 24 hours: {fmt_pair(s24)}",
+        f"📊 7 days: {fmt_pair(s7)}",
+        f"📊 30 days: {fmt_pair(s30)}",
+        "",
+        f'🔗 View transaction on <a href="https://solscan.io/tx/{sig}">Solscan</a>.',
     ]
     return "\n".join(lines)
