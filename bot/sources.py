@@ -2,7 +2,6 @@
 from __future__ import annotations
 
 import asyncio
-import math
 import random
 from typing import List, Dict, Any, Tuple, Optional
 import httpx
@@ -13,7 +12,7 @@ import httpx
 # ------------------------
 async def _get_price_usd(coingecko_id: str = "render-token") -> float:
     """
-    Fetch current USD price for RNDR/RENDER. We use current price as an approximation
+    Fetch current USD price for RENDER/RNDR. We use current price as an approximation
     to keep things simple and robust. If you want strict 'price at burn time',
     we can swap this later for a time-bucketed lookup.
     """
@@ -50,7 +49,6 @@ async def _get_json_with_backoff(
             async with httpx.AsyncClient(timeout=20) as client:
                 resp = await client.get(url, params=params, headers=headers)
             if resp.status_code == 429:
-                # Respect Retry-After if present; else exponential with jitter
                 retry_after = resp.headers.get("Retry-After")
                 if retry_after:
                     delay = float(retry_after)
@@ -59,21 +57,17 @@ async def _get_json_with_backoff(
                 await asyncio.sleep(min(delay, 8.0))
                 continue
 
-            # If API key missing/wrong, don't spin
             if resp.status_code in (401, 403):
-                resp.raise_for_status()  # will raise HTTPStatusError
+                resp.raise_for_status()  # fail fast on auth
 
             resp.raise_for_status()
             data = resp.json()
             if isinstance(data, list):
                 return data
-            # If shape changes, normalize to list
             return list(data or [])
         except Exception as e:
             last_exc = e
-            # Soft backoff on transient issues
             await asyncio.sleep(min(base_delay * (2 ** (attempt - 1)), 8.0))
-    # Out of attempts
     assert last_exc is not None
     raise last_exc
 
@@ -85,7 +79,6 @@ def _extract_amount(tr: Dict[str, Any]) -> float:
     """
     Try to extract decimal amount from various Helius token transfer shapes.
     """
-    # Preferred already-decimal fields
     for key in ("tokenAmount", "amountDecimal"):
         v = tr.get(key)
         if v is not None:
@@ -94,7 +87,6 @@ def _extract_amount(tr: Dict[str, Any]) -> float:
             except Exception:
                 pass
 
-    # Integer + decimals path
     raw = tr.get("amount")
     dec = tr.get("decimals")
     if isinstance(raw, int) and isinstance(dec, int) and dec > 0:
@@ -103,43 +95,32 @@ def _extract_amount(tr: Dict[str, Any]) -> float:
         except Exception:
             pass
 
-    # Fallback
     try:
         return float(raw or 0)
     except Exception:
         return 0.0
 
 
-def _matches_burn_vault(tr: Dict[str, Any], burn_vault: str) -> bool:
+def _is_to_burn_vault(tr: Dict[str, Any], burn_vault: str) -> bool:
     """
     True if the transfer's destination token account equals the burn deposit ATA.
     We check multiple possible field names across Helius versions.
+    NOTE: Because an SPL token account is tied to a single mint, we do NOT need
+    to check symbol/mint if we trust the ATA.
     """
     burn_vault = burn_vault.strip()
     if not burn_vault:
         return False
 
-    # Most common fields
-    candidates = [
+    for c in (
         tr.get("toUserAccount"),
         tr.get("toTokenAccount"),
-        tr.get("to"),  # sometimes generic
+        tr.get("to"),
         tr.get("destination"),
-    ]
-    for c in candidates:
+    ):
         if isinstance(c, str) and c.strip() == burn_vault:
             return True
     return False
-
-
-def _matches_token(tr: Dict[str, Any], mint: Optional[str], symbol: str) -> bool:
-    """
-    Prefer exact mint match if provided; otherwise fall back to symbol (upper-cased).
-    """
-    if mint:
-        return (tr.get("mint") or "").strip() == mint.strip()
-    sym = (tr.get("symbol") or tr.get("tokenSymbol") or "").upper()
-    return sym == (symbol or "RENDER").upper()
 
 
 # ------------------------
@@ -163,20 +144,15 @@ async def get_new_burns(cfg, state: dict) -> List[Dict[str, Any]]:
     if not burn_vault:
         return []
 
-    render_mint = (getattr(cfg, "RENDER_MINT_ADDRESS", "") or "").strip()  # optional
-    symbol = (getattr(cfg, "RNDR_SYMBOL", "RENDER") or "RENDER").upper()
-
     base = f"https://api.helius.xyz/v0/addresses/{burn_vault}/transactions"
-    # Helius accepts the api-key as a query param on v0
     common_params = {"api-key": api_key, "limit": 100}
 
     last_sig: Optional[str] = state.get("last_sig") or None
-    before: Optional[str] = None  # pagination cursor (older pages)
+    before: Optional[str] = None
     pages = 0
-    max_pages = 5  # safety; fetch up to 500 tx to find last_sig
+    max_pages = 5
     found_last = False
 
-    # Price (approx) once per run
     price_usd = await _get_price_usd(getattr(cfg, "COINGECKO_ID", "render-token"))
 
     events_by_sig: Dict[str, Dict[str, Any]] = {}
@@ -192,34 +168,28 @@ async def get_new_burns(cfg, state: dict) -> List[Dict[str, Any]]:
         if not txs:
             break
 
-        for idx, tx in enumerate(txs):
+        for tx in txs:
             sig = tx.get("signature")
             if not isinstance(sig, str):
                 continue
 
-            # Mark the first-ever seen signature this run (the "newest" we processed)
             if newest_seen_sig is None:
                 newest_seen_sig = sig
 
-            # Stop if we reached the last processed signature
             if last_sig and sig == last_sig:
                 found_last = True
                 break
 
             ts = int(tx.get("timestamp") or tx.get("blockTime") or 0)
 
-            # token transfers may be in different places depending on Helius version
             transfers = tx.get("tokenTransfers") or []
             if not transfers:
                 ev = tx.get("events") or {}
                 transfers = ev.get("tokenTransfers") or []
 
-            # Sum all qualifying transfers in THIS transaction
             total_amount = 0.0
             for tr in transfers:
-                if not _matches_burn_vault(tr, burn_vault):
-                    continue
-                if not _matches_token(tr, render_mint, symbol):
+                if not _is_to_burn_vault(tr, burn_vault):
                     continue
                 amt = _extract_amount(tr)
                 if amt > 0:
@@ -236,15 +206,13 @@ async def get_new_burns(cfg, state: dict) -> List[Dict[str, Any]]:
         if found_last:
             break
 
-        # Prepare for next page (older)
         before = txs[-1].get("signature") or before
         pages += 1
 
-    # Convert to list and order oldest -> newest for nicer reading/sending
     new_events = list(events_by_sig.values())
     new_events.sort(key=lambda e: e["ts"])
 
-    # Advance cursor ONLY if we actually found qualifying events.
+    # Advance cursor ONLY if we actually found qualifying events
     if new_events and newest_seen_sig:
         state["last_sig"] = newest_seen_sig
 
