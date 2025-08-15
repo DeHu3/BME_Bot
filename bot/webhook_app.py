@@ -1,6 +1,7 @@
 # bot/webhook_app.py
 import os
 import logging
+import asyncio
 from aiohttp import web
 from telegram import Update
 from telegram.ext import Application, CommandHandler, MessageHandler, filters
@@ -14,6 +15,9 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s:%(name
 log = logging.getLogger("webhook_app")
 # quiet noisy client logs
 logging.getLogger("httpx").setLevel(logging.WARNING)
+
+# prevent overlapping cron/admin runs
+_RUN_LOCK = asyncio.Lock()
 
 
 # --------- BOT HANDLERS / BUILD PTB APP ----------
@@ -36,38 +40,44 @@ async def run_burn_once(bot, cfg):
     """
     db = SubscriberDB(cfg.DATABASE_URL)
 
-    # Load & persist state using the "burn" key (sources.py updates cursors inside it)
+    # Load state (sources.get_new_burns mutates this dict in-place with last_sig)
     state = await db.get_state("burn")
 
     # Get new events since the last saved cursors; sources.py handles Helius + filtering
     events = await sources.get_new_burns(cfg, state)
 
-    # Save updated cursors/state immediately so we never replay on failures
-    await db.save_state("burn", state)
-
     if not events:
+        log.info("burn job: no new events; cursor unchanged (last_sig=%s)", state.get("last_sig"))
         return
 
     subs = await db.get_subs("burn_subs")
     if not subs:
+        # No subscribers: advance the cursor so we don't replay the same page forever.
+        await db.save_state("burn", state)
+        log.info(
+            "burn job: %d event(s) but 0 subscribers; saved cursor last_sig=%s",
+            len(events), state.get("last_sig")
+        )
         return
 
     # Record each event, compute rolling sums, and send alerts
+    log.info("burn job: %d event(s), sending to %d subscriber(s)", len(events), len(subs))
     for ev in events:
+        # Persist the event (totals are based on DB; ON CONFLICT DO NOTHING keeps totals idempotent)
         await db.record_burn(ev["signature"], ev["ts"], ev["amount"], ev.get("price_usd"))
+
         totals = await db.sums_24_7_30()
         text = sources.format_burn(ev, totals)
 
         for chat_id in subs:
             try:
-                await bot.send_message(
-                    chat_id,
-                    text,
-                    parse_mode="HTML",
-                    disable_web_page_preview=True
-                )
+                await bot.send_message(chat_id, text, disable_web_page_preview=True)
             except Exception:
                 log.exception("send burn failed chat_id=%s", chat_id)
+
+    # ✅ Only now that recording + sends are done do we advance the cursor
+    await db.save_state("burn", state)
+    log.info("burn job: saved cursor last_sig=%s", state.get("last_sig"))
 
 
 # --------- AIOHTTP ROUTES ----------
@@ -86,7 +96,9 @@ async def handle_cron_burn(request: web.Request) -> web.Response:
     if not await _check_secret(request):
         return web.Response(status=403, text="forbidden")
     try:
-        await run_burn_once(request.app["ptb"].bot, request.app["cfg"])
+        # prevent overlap with manual/admin triggers or slow previous run
+        async with _RUN_LOCK:
+            await run_burn_once(request.app["ptb"].bot, request.app["cfg"])
         return web.Response(text="ok")
     except Exception:
         log.exception("cron burn failed")
@@ -139,12 +151,7 @@ async def handle_admin_replay(request: web.Request) -> web.Response:
 
             for chat_id in subs:
                 try:
-                    await ptb.bot.send_message(
-                        chat_id,
-                        text,
-                        parse_mode="HTML",
-                        disable_web_page_preview=True
-                    )
+                    await ptb.bot.send_message(chat_id, text, disable_web_page_preview=True)
                 except Exception:
                     log.exception("send burn (replay) failed chat_id=%s", chat_id)
             sent += 1
