@@ -136,7 +136,7 @@ def _is_to_burn_vault(tr: Dict[str, Any], burn_vault: str) -> bool:
 
 
 # ------------------------
-# Public API used by webhook_app.run_burn_once
+# Public API used by webhook_app.run_burn_once (poll)
 # ------------------------
 async def get_new_burns(
     cfg,
@@ -253,6 +253,67 @@ async def get_new_burns(
         state["last_sig"] = newest_page_sig
 
     return new_events
+
+
+# ------------------------
+# NEW: Parse Helius Enhanced Webhook payload (push)
+# ------------------------
+async def parse_helius_webhook(cfg, payload: Any) -> List[Dict[str, Any]]:
+    """
+    Parse Helius Enhanced Webhook payload and return burn events in the
+    same shape as get_new_burns(): {'signature','ts','amount','price_usd'}.
+    We detect deposits into the configured burn vault ATA.
+    """
+    burn_vault = (getattr(cfg, "BURN_VAULT_ADDRESS", "") or getattr(cfg, "RENDER_BURN_ADDRESS", "") or "").strip()
+    if not burn_vault:
+        return []
+
+    # Helius may wrap transactions under different keys
+    if isinstance(payload, list):
+        txs = payload
+    elif isinstance(payload, dict):
+        txs = (
+            payload.get("data")
+            or payload.get("transactions")
+            or payload.get("events")
+            or payload.get("payload")
+            or []
+        )
+    else:
+        txs = []
+
+    price_usd = await _get_price_usd(getattr(cfg, "COINGECKO_ID", "render-token"))
+    by_sig: Dict[str, Dict[str, Any]] = {}
+
+    for tx in txs:
+        sig = tx.get("signature") or tx.get("transaction") or tx.get("txHash")
+        if not isinstance(sig, str):
+            continue
+        ts = int(tx.get("timestamp") or tx.get("blockTime") or 0)
+
+        transfers = tx.get("tokenTransfers") or []
+        if not transfers:
+            ev = tx.get("events") or {}
+            transfers = ev.get("tokenTransfers") or []
+
+        total = 0.0
+        for tr in transfers:
+            if _is_to_burn_vault(tr, burn_vault):
+                amt = _extract_amount(tr)
+                if amt > 0:
+                    total += amt
+
+        if total > 0:
+            by_sig[sig] = {
+                "signature": sig,
+                "ts": ts,
+                "amount": total,
+                "price_usd": price_usd if price_usd > 0 else None,
+            }
+
+    out = list(by_sig.values())
+    out.sort(key=lambda e: (e["ts"], e["signature"]))
+    return out
 
 
 # ------------------------
