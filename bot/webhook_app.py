@@ -162,21 +162,35 @@ async def handle_admin_replay(request: web.Request) -> web.Response:
 # ---- NEW: Helius Enhanced Webhook endpoint (push) ----
 async def handle_helius_webhook(request: web.Request) -> web.Response:
     cfg = request.app["cfg"]
-    # Accept secret from cfg or env (optional). If set, verify HMAC SHA-256 of raw body.
+
+    # Secret used either for HMAC validation OR simple header match.
     secret = (getattr(cfg, "HELIUS_WEBHOOK_SECRET", "") or os.environ.get("HELIUS_WEBHOOK_SECRET", "")).strip()
 
+    # Read raw body once (needed if verifying HMAC)
     try:
         raw = await request.read()
     except Exception:
         return web.Response(status=400, text="bad request")
 
-    sig_hdr = request.headers.get("X-Helius-Signature", "")
+    # Accept either:
+    #  1) X-Helius-Signature: HMAC_SHA256(secret, raw_body)  OR
+    #  2) X-Helius-Auth: <secret> (Helius "Authentication Header" passthrough)
     if secret:
-        expected = hmac.new(secret.encode("utf-8"), raw, hashlib.sha256).hexdigest()
-        if not hmac.compare_digest(sig_hdr or "", expected):
-            log.warning("Helius webhook signature mismatch")
+        sig_hdr = (request.headers.get("X-Helius-Signature") or "").strip()
+        auth_hdr = (request.headers.get("X-Helius-Auth") or "").strip()
+
+        ok = False
+        if sig_hdr:
+            expected = hmac.new(secret.encode("utf-8"), raw, hashlib.sha256).hexdigest()
+            ok = hmac.compare_digest(sig_hdr, expected)
+        if not ok and auth_hdr:
+            ok = hmac.compare_digest(auth_hdr, secret)
+
+        if not ok:
+            log.warning("Helius webhook auth failed")
             return web.Response(status=403, text="forbidden")
 
+    # Parse JSON after auth
     try:
         payload = json.loads(raw.decode("utf-8"))
     except Exception:
@@ -207,7 +221,9 @@ async def handle_helius_webhook(request: web.Request) -> web.Response:
 
             for chat_id in subs:
                 try:
-                    await request.app["ptb"].bot.send_message(chat_id, text, parse_mode="HTML", disable_web_page_preview=True)
+                    await request.app["ptb"].bot.send_message(
+                        chat_id, text, parse_mode="HTML", disable_web_page_preview=True
+                    )
                 except Exception:
                     log.exception("send burn (webhook) failed chat_id=%s", chat_id)
             sent += 1
@@ -289,7 +305,7 @@ def build_web_app() -> web.Application:
         web.get("/cron/burn", handle_cron_burn),
         web.get("/admin/reset-burn-cursor", handle_admin_reset_cursor),
         web.get("/admin/replay", handle_admin_replay),
-        web.post("/helius/webhook", handle_helius_webhook),  # <-- NEW
+        web.post("/helius/webhook", handle_helius_webhook),  # <-- webhook POST target
         web.post(hook_path, handle_telegram_webhook),
     ])
     app.on_startup.append(on_startup)
