@@ -106,7 +106,7 @@ class SubscriberDB:
     async def record_burn(self, signature: str, ts: int, amount: float, price_usd: float | None) -> bool:
         """
         Insert and return True if a new row was inserted; False if it already existed.
-        This lets cron avoid duplicate user messages while totals remain idempotent.
+        This lets cron/webhook avoid duplicate user messages while totals remain idempotent.
         """
         usd = (price_usd or 0.0) * amount
         pool = await self.pool()
