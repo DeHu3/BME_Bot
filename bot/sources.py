@@ -1,20 +1,18 @@
 # bot/sources.py
 from __future__ import annotations
 
+import os
 import asyncio
 import random
+import time
 from typing import List, Dict, Any, Tuple, Optional
 import httpx
 
 
 # ------------------------
-# Price (current price; simple and robust)
+# Price (current price; simple & robust)
 # ------------------------
 async def _get_price_usd(coingecko_id: str = "render-token") -> float:
-    """
-    Fetch current USD price for RENDER/RNDR. We use current price as an
-    approximation to keep things simple and robust.
-    """
     url = "https://api.coingecko.com/api/v3/simple/price"
     params = {"ids": coingecko_id, "vs_currencies": "usd"}
     try:
@@ -28,7 +26,7 @@ async def _get_price_usd(coingecko_id: str = "render-token") -> float:
 
 
 # ------------------------
-# HTTP helper with backoff
+# HTTP helpers with backoff (handles 429s)
 # ------------------------
 async def _get_json_with_backoff(
     url: str,
@@ -37,12 +35,7 @@ async def _get_json_with_backoff(
     max_attempts: int = 6,
     base_delay: float = 0.5,
 ) -> List[Dict[str, Any]]:
-    """
-    GET JSON with exponential backoff for 429 (Helius rate limits).
-    If 401/403, raise immediately (bad/missing API key).
-    Returns a list (Helius returns a list of txs).
-    """
-    last_exc: Optional[Exception] = None
+    last_exc = None
     for attempt in range(1, max_attempts + 1):
         try:
             async with httpx.AsyncClient(timeout=20) as client:
@@ -75,9 +68,7 @@ async def _get_json_with_backoff(
 # Extract helpers (Helius shapes can vary)
 # ------------------------
 def _extract_amount(tr: Dict[str, Any]) -> float:
-    """
-    Try to extract decimal amount from various Helius token transfer shapes.
-    """
+    # Try pre-decimal fields first
     for key in ("tokenAmount", "amountDecimal"):
         v = tr.get(key)
         if v is not None:
@@ -103,9 +94,7 @@ def _extract_amount(tr: Dict[str, Any]) -> float:
 def _is_to_burn_vault(tr: Dict[str, Any], burn_vault: str) -> bool:
     """
     True if the transfer's destination token account equals the burn deposit ATA.
-    We check multiple possible field names across Helius versions.
-    NOTE: Because an SPL token account is tied to a single mint, we do NOT need
-    to check symbol/mint if we trust the ATA.
+    We rely on the ATA being for RENDER, so we don't additionally check the mint/symbol.
     """
     burn_vault = (burn_vault or "").strip()
     if not burn_vault:
@@ -122,17 +111,32 @@ def _is_to_burn_vault(tr: Dict[str, Any], burn_vault: str) -> bool:
     return False
 
 
+def _lookback_secs(cfg) -> int:
+    """
+    Rolling window size (minutes) -> seconds. Optional, defaults to 45 minutes.
+    Read from cfg.BURN_LOOKBACK_MINUTES if present, else env, else 45.
+    """
+    v = getattr(cfg, "BURN_LOOKBACK_MINUTES", None)
+    if v is None:
+        v = os.environ.get("BURN_LOOKBACK_MINUTES", "45")
+    try:
+        mins = int(v)
+    except Exception:
+        mins = 45
+    mins = max(5, min(mins, 180))  # clamp between 5m and 3h
+    return mins * 60
+
+
 # ------------------------
 # Public API used by webhook_app.run_burn_once
 # ------------------------
 async def get_new_burns(cfg, state: dict) -> List[Dict[str, Any]]:
     """
-    Return new *deposit* events into the burn vault ATA (most frequent signal).
-    Strict rollback version: uses ONLY a signature cursor (state['last_sig']).
-    We stop exactly when we hit the last processed signature.
-
-    Each returned event is one per transaction (we sum all qualifying transfers
-    within the tx), so DB dedupe by signature never loses value.
+    Return *deposit* events into the burn vault ATA from a rolling time window.
+    We DO NOT rely on a fragile last_sig boundary; instead we:
+      - page recent address txs for the last N minutes (default 45m),
+      - sum per-transaction RENDER amounts arriving at the burn vault ATA,
+      - return one event per tx (signature).
 
     Returned event shape:
       {'signature': str, 'ts': int, 'amount': float, 'price_usd': Optional[float]}
@@ -152,17 +156,14 @@ async def get_new_burns(cfg, state: dict) -> List[Dict[str, Any]]:
     base = f"https://api.helius.xyz/v0/addresses/{burn_vault}/transactions"
     common_params = {"api-key": api_key, "limit": 100}
 
-    last_sig: Optional[str] = state.get("last_sig") or None
+    cutoff_ts = int(time.time()) - _lookback_secs(cfg)
     before: Optional[str] = None
     pages = 0
-    max_pages = 3
-    found_cursor = False
+    max_pages = 8  # enough to cover the window even during bursts
 
-    # One price fetch per run (simple approximation)
     price_usd = await _get_price_usd(getattr(cfg, "COINGECKO_ID", "render-token"))
 
     events_by_sig: Dict[str, Dict[str, Any]] = {}
-    newest_seen_sig: Optional[str] = None
 
     while pages < max_pages:
         params = dict(common_params)
@@ -170,25 +171,23 @@ async def get_new_burns(cfg, state: dict) -> List[Dict[str, Any]]:
             params["before"] = before
 
         txs: List[Dict[str, Any]] = await _get_json_with_backoff(base, params=params)
-
         if not txs:
             break
+
+        oldest_ts_in_page = None
 
         for tx in txs:
             sig = tx.get("signature")
             if not isinstance(sig, str):
                 continue
 
-            # Remember the topmost signature on the very first tx we see
-            if newest_seen_sig is None:
-                newest_seen_sig = sig
-
-            # Stop at the saved cursor (strict rollback behaviour)
-            if last_sig and sig == last_sig:
-                found_cursor = True
-                break
-
             ts = int(tx.get("timestamp") or tx.get("blockTime") or 0)
+            if oldest_ts_in_page is None or (ts and ts < oldest_ts_in_page):
+                oldest_ts_in_page = ts
+
+            # Only consider txs inside the lookback window
+            if ts and ts < cutoff_ts:
+                continue
 
             transfers = tx.get("tokenTransfers") or []
             if not transfers:
@@ -211,21 +210,18 @@ async def get_new_burns(cfg, state: dict) -> List[Dict[str, Any]]:
                     "price_usd": price_usd if price_usd > 0 else None,
                 }
 
-        if found_cursor:
+        # Stop if we've reached clearly outside the window.
+        if oldest_ts_in_page is not None and oldest_ts_in_page < cutoff_ts:
             break
 
-        # paginate
         before = txs[-1].get("signature") or before
         pages += 1
 
-    # Deterministic order for /admin/replay?n=
+    # Sort ascending by time so alerts read naturally
     new_events = list(events_by_sig.values())
-    new_events.sort(key=lambda e: (e["ts"], e["signature"]))
-
-    # Advance cursor ONLY if we actually found qualifying events
-    if new_events and newest_seen_sig:
-        state["last_sig"] = newest_seen_sig
-
+    new_events.sort(key=lambda e: e["ts"])
+    # Optionally store a hint for visibility (not relied upon)
+    state["last_checked_at"] = int(time.time())
     return new_events
 
 
@@ -236,9 +232,6 @@ def format_burn(
     ev: Dict[str, Any],
     totals: Tuple[Tuple[float, float], Tuple[float, float], Tuple[float, float]],
 ) -> str:
-    """
-    totals: ((a24,u24),(a7,u7),(a30,u30))
-    """
     amt = float(ev["amount"])
     p = float(ev.get("price_usd") or 0.0)
     usd = amt * p if p else 0.0
@@ -252,7 +245,7 @@ def format_burn(
 
     lines = [
         f"🔥  {amt:,.2f} RENDER (${usd:,.2f})",
-        "",  # blank line
+        "",
         f"📊 24 hours: {fmt_pair(s24)}",
         f"📊 7 days: {fmt_pair(s7)}",
         f"📊 30 days: {fmt_pair(s30)}",
