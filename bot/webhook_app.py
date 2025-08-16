@@ -2,6 +2,9 @@
 import os
 import logging
 import asyncio
+import json
+import hmac
+import hashlib
 from aiohttp import web
 from telegram import Update
 from telegram.ext import Application, CommandHandler, MessageHandler, filters
@@ -38,35 +41,26 @@ async def run_burn_once(bot, cfg):
     - Persist cursor AFTER sending
     """
     db = SubscriberDB(cfg.DATABASE_URL)
-
     state = await db.get_state("burn")  # may contain last_ts/last_sig (or be {})
     events = await sources.get_new_burns(cfg, state, ignore_cursor=False)
 
     if not events:
-        log.info(
-            "burn job: no new events; cursor unchanged (last_ts=%s last_sig=%s)",
-            state.get("last_ts"),
-            state.get("last_sig"),
-        )
+        log.info("burn job: no new events; cursor unchanged (last_ts=%s last_sig=%s)",
+                 state.get("last_ts"), state.get("last_sig"))
         return
 
     subs = await db.get_subs("burn_subs")
     if not subs:
         # advance cursor so we don't replay forever when no subs
         await db.save_state("burn", state)
-        log.info(
-            "burn job: %d event(s) but 0 subscribers; saved cursor last_sig=%s",
-            len(events),
-            state.get("last_sig"),
-        )
+        log.info("burn job: %d event(s) but 0 subscribers; saved cursor last_sig=%s",
+                 len(events), state.get("last_sig"))
         return
 
     log.info("burn job: %d event(s), sending to %d subscriber(s)", len(events), len(subs))
     for ev in events:
-        # Insert into DB. Back-compat: treat None (no boolean returned) as "inserted".
-        inserted = await db.record_burn(ev["signature"], ev["ts"], ev["amount"], ev.get("price_usd"))
-        if inserted is False:
-            # explicit False means "already present" -> skip sending duplicate
+        is_new = await db.record_burn(ev["signature"], ev["ts"], ev["amount"], ev.get("price_usd"))
+        if not is_new:
             continue
 
         totals = await db.sums_24_7_30()
@@ -165,6 +159,65 @@ async def handle_admin_replay(request: web.Request) -> web.Response:
         return web.Response(status=500, text="error")
 
 
+# ---- NEW: Helius Enhanced Webhook endpoint (push) ----
+async def handle_helius_webhook(request: web.Request) -> web.Response:
+    cfg = request.app["cfg"]
+    # Accept secret from cfg or env (optional). If set, verify HMAC SHA-256 of raw body.
+    secret = (getattr(cfg, "HELIUS_WEBHOOK_SECRET", "") or os.environ.get("HELIUS_WEBHOOK_SECRET", "")).strip()
+
+    try:
+        raw = await request.read()
+    except Exception:
+        return web.Response(status=400, text="bad request")
+
+    sig_hdr = request.headers.get("X-Helius-Signature", "")
+    if secret:
+        expected = hmac.new(secret.encode("utf-8"), raw, hashlib.sha256).hexdigest()
+        if not hmac.compare_digest(sig_hdr or "", expected):
+            log.warning("Helius webhook signature mismatch")
+            return web.Response(status=403, text="forbidden")
+
+    try:
+        payload = json.loads(raw.decode("utf-8"))
+    except Exception:
+        return web.Response(status=400, text="bad json")
+
+    try:
+        # Parse → record → if new → send
+        events = await sources.parse_helius_webhook(cfg, payload)
+        if not events:
+            return web.Response(text="ok")
+
+        db = SubscriberDB(cfg.DATABASE_URL)
+        subs = await db.get_subs("burn_subs")
+        if not subs:
+            # Still record; idempotent with ON CONFLICT DO NOTHING
+            for ev in events:
+                await db.record_burn(ev["signature"], ev["ts"], ev["amount"], ev.get("price_usd"))
+            return web.Response(text="ok")
+
+        sent = 0
+        for ev in events:
+            is_new = await db.record_burn(ev["signature"], ev["ts"], ev["amount"], ev.get("price_usd"))
+            if not is_new:  # duplicate delivery/retry → skip notify
+                continue
+
+            totals = await db.sums_24_7_30()
+            text = sources.format_burn(ev, totals)
+
+            for chat_id in subs:
+                try:
+                    await request.app["ptb"].bot.send_message(chat_id, text, parse_mode="HTML", disable_web_page_preview=True)
+                except Exception:
+                    log.exception("send burn (webhook) failed chat_id=%s", chat_id)
+            sent += 1
+
+        return web.Response(text=f"ok: {sent}")
+    except Exception:
+        log.exception("helius webhook failed")
+        return web.Response(status=500, text="error")
+
+
 async def handle_telegram_webhook(request: web.Request) -> web.Response:
     cfg = request.app["cfg"]
     ptb: Application = request.app["ptb"]
@@ -199,11 +252,8 @@ async def on_startup(app: web.Application) -> None:
         log.exception("ensure_schema failed")
         has_key = bool(getattr(cfg, "HELIUS_API_KEY", ""))
         burn_addr = (getattr(cfg, "BURN_VAULT_ADDRESS", "") or getattr(cfg, "RENDER_BURN_ADDRESS", ""))
-        log.info(
-            "Startup env check: helius_key_present=%s burn_vault=%s",
-            has_key,
-            (burn_addr[:6] + "..." if burn_addr else "MISSING"),
-        )
+        log.info("Startup env check: helius_key_present=%s burn_vault=%s",
+                 has_key, (burn_addr[:6] + "..." if burn_addr else "MISSING"))
 
     hook_url = f"{cfg.WEBHOOK_URL.rstrip('/')}/{cfg.WEBHOOK_PATH.lstrip('/')}"
     log.info("Setting webhook_url=%s", hook_url)
@@ -239,6 +289,7 @@ def build_web_app() -> web.Application:
         web.get("/cron/burn", handle_cron_burn),
         web.get("/admin/reset-burn-cursor", handle_admin_reset_cursor),
         web.get("/admin/replay", handle_admin_replay),
+        web.post("/helius/webhook", handle_helius_webhook),  # <-- NEW
         web.post(hook_path, handle_telegram_webhook),
     ])
     app.on_startup.append(on_startup)
