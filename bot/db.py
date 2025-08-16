@@ -103,19 +103,24 @@ class SubscriberDB:
                 key, payload
             )
 
-    # ---------- burns ----------
-    async def record_burn(self, signature: str, ts: int, amount: float, price_usd: float | None) -> None:
+    async def record_burn(self, signature: str, ts: int, amount: float, price_usd: float | None) -> bool:
+        """
+        Insert the burn if it's new; return True if inserted, False if it already existed.
+        """
         usd = (price_usd or 0.0) * amount
         pool = await self.pool()
         async with pool.acquire() as con:
-            await con.execute(
+            row = await con.fetchrow(
                 """
                 INSERT INTO burns(signature, ts, amount, price_usd, usd)
                 VALUES($1, to_timestamp($2), $3, $4, $5)
-                ON CONFLICT (signature) DO NOTHING;
+                ON CONFLICT (signature) DO NOTHING
+                RETURNING 1 AS inserted;
                 """,
                 signature, ts, amount, price_usd, usd
             )
+        return row is not None
+
 
     async def _sums_since(self, seconds: int) -> Tuple[float, float]:
         pool = await self.pool()
