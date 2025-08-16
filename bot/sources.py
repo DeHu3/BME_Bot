@@ -143,7 +143,7 @@ async def get_new_burns(
     state: dict,
     *,
     ignore_cursor: bool = False,
-    max_pages: int = 3,
+    max_pages: int = 3,   # kept for compatibility; no longer used as a hard cap
     limit: int = 100,
 ) -> List[Dict[str, Any]]:
     """
@@ -155,6 +155,9 @@ async def get_new_burns(
 
     If ignore_cursor=True (admin replay), we don't filter by cursor and we DO NOT
     touch the persisted cursor (the caller passes a temp state).
+
+    NOTE: This version **removes the page cap**. We page until we hit the
+    (last_ts/last_sig) barrier or exhaust history.
     """
     api_key = (getattr(cfg, "HELIUS_API_KEY", "") or "").strip()
     if not api_key:
@@ -179,9 +182,9 @@ async def get_new_burns(
 
     events_by_sig: Dict[str, Dict[str, Any]] = {}
     before: Optional[str] = None
-    pages = 0
+    pages = 0  # informational only
 
-    while pages < max_pages:
+    while True:
         params = dict(common_params)
         if before:
             params["before"] = before
@@ -190,7 +193,7 @@ async def get_new_burns(
         if not txs:
             break
 
-        # Capture page-0 "newest seen" for advancing cursor later
+        # Record the very newest tx seen (page 0 top) so caller can advance cursor
         if pages == 0:
             s0 = txs[0].get("signature")
             t0 = int(txs[0].get("timestamp") or txs[0].get("blockTime") or 0)
@@ -198,23 +201,21 @@ async def get_new_burns(
                 newest_page_sig = s0
                 newest_page_ts = t0
 
+        stop = False
         for tx in txs:
             sig = tx.get("signature")
             if not isinstance(sig, str):
                 continue
             ts = int(tx.get("timestamp") or tx.get("blockTime") or 0)
 
-            # Cursor filter unless we're doing admin replay
-            if not ignore_cursor:
-                if last_ts > 0:
-                    if ts < last_ts:
-                        # older than our barrier; keep scanning (another page) just in case,
-                        # but don't treat as new
-                        pass
-                    elif ts == last_ts and last_sig and sig == last_sig:
-                        # exactly the barrier tx; skip
-                        continue
-                # else (ts > last_ts) or (ts == last_ts and sig != last_sig) -> acceptable
+            # Cursor barrier unless we're doing admin replay
+            if not ignore_cursor and last_ts > 0:
+                if ts < last_ts:
+                    stop = True
+                    break
+                if last_sig and ts == last_ts and sig == last_sig:
+                    stop = True
+                    break
 
             transfers = tx.get("tokenTransfers") or []
             if not transfers:
@@ -235,6 +236,9 @@ async def get_new_burns(
                     "amount": total_amount,
                     "price_usd": price_usd if price_usd > 0 else None,
                 }
+
+        if stop:
+            break
 
         before = txs[-1].get("signature") or before
         pages += 1
