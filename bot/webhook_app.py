@@ -43,23 +43,30 @@ async def run_burn_once(bot, cfg):
     events = await sources.get_new_burns(cfg, state, ignore_cursor=False)
 
     if not events:
-        log.info("burn job: no new events; cursor unchanged (last_ts=%s last_sig=%s)",
-                 state.get("last_ts"), state.get("last_sig"))
+        log.info(
+            "burn job: no new events; cursor unchanged (last_ts=%s last_sig=%s)",
+            state.get("last_ts"),
+            state.get("last_sig"),
+        )
         return
 
     subs = await db.get_subs("burn_subs")
     if not subs:
         # advance cursor so we don't replay forever when no subs
         await db.save_state("burn", state)
-        log.info("burn job: %d event(s) but 0 subscribers; saved cursor last_sig=%s",
-                 len(events), state.get("last_sig"))
+        log.info(
+            "burn job: %d event(s) but 0 subscribers; saved cursor last_sig=%s",
+            len(events),
+            state.get("last_sig"),
+        )
         return
 
     log.info("burn job: %d event(s), sending to %d subscriber(s)", len(events), len(subs))
     for ev in events:
-        # Insert into DB; only send if it's a new row (prevents dup messages)
-        is_new = await db.record_burn(ev["signature"], ev["ts"], ev["amount"], ev.get("price_usd"))
-        if not is_new:
+        # Insert into DB. Back-compat: treat None (no boolean returned) as "inserted".
+        inserted = await db.record_burn(ev["signature"], ev["ts"], ev["amount"], ev.get("price_usd"))
+        if inserted is False:
+            # explicit False means "already present" -> skip sending duplicate
             continue
 
         totals = await db.sums_24_7_30()
@@ -192,8 +199,11 @@ async def on_startup(app: web.Application) -> None:
         log.exception("ensure_schema failed")
         has_key = bool(getattr(cfg, "HELIUS_API_KEY", ""))
         burn_addr = (getattr(cfg, "BURN_VAULT_ADDRESS", "") or getattr(cfg, "RENDER_BURN_ADDRESS", ""))
-        log.info("Startup env check: helius_key_present=%s burn_vault=%s",
-                 has_key, (burn_addr[:6] + "..." if burn_addr else "MISSING"))
+        log.info(
+            "Startup env check: helius_key_present=%s burn_vault=%s",
+            has_key,
+            (burn_addr[:6] + "..." if burn_addr else "MISSING"),
+        )
 
     hook_url = f"{cfg.WEBHOOK_URL.rstrip('/')}/{cfg.WEBHOOK_PATH.lstrip('/')}"
     log.info("Setting webhook_url=%s", hook_url)
