@@ -82,7 +82,6 @@ class SubscriberDB:
         if not row:
             return {}
         val = row["value"]
-        # asyncpg returns JSONB as Python dict by default; if it's text for any reason, decode.
         if isinstance(val, dict):
             return val
         try:
@@ -103,24 +102,28 @@ class SubscriberDB:
                 key, payload
             )
 
+    # ---------- burns ----------
     async def record_burn(self, signature: str, ts: int, amount: float, price_usd: float | None) -> bool:
         """
-        Insert the burn if it's new; return True if inserted, False if it already existed.
+        Insert and return True if a new row was inserted; False if it already existed.
+        This lets cron avoid duplicate user messages while totals remain idempotent.
         """
         usd = (price_usd or 0.0) * amount
         pool = await self.pool()
         async with pool.acquire() as con:
-            row = await con.fetchrow(
+            status = await con.execute(
                 """
                 INSERT INTO burns(signature, ts, amount, price_usd, usd)
                 VALUES($1, to_timestamp($2), $3, $4, $5)
-                ON CONFLICT (signature) DO NOTHING
-                RETURNING 1 AS inserted;
+                ON CONFLICT (signature) DO NOTHING;
                 """,
                 signature, ts, amount, price_usd, usd
             )
-        return row is not None
-
+        # asyncpg returns "INSERT 0 1" if inserted, "INSERT 0 0" if not
+        try:
+            return status.split()[-1] == "1"
+        except Exception:
+            return False
 
     async def _sums_since(self, seconds: int) -> Tuple[float, float]:
         pool = await self.pool()
