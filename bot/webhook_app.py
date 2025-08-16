@@ -13,7 +13,6 @@ from bot import sources
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s:%(name)s:%(message)s")
 log = logging.getLogger("webhook_app")
-# quiet noisy client logs
 logging.getLogger("httpx").setLevel(logging.WARNING)
 
 # prevent overlapping cron/admin runs
@@ -33,33 +32,34 @@ def build_ptb_application(cfg) -> Application:
 # --------- BURN JOB (HTTP CRON TRIGGER USES THIS) ----------
 async def run_burn_once(bot, cfg):
     """
-    Pull recent deposits to the burn address and notify 'burn_subs'.
-    We scan a rolling time window (see sources.get_new_burns) and
-    only send if the signature was newly inserted into the DB.
+    Pull new deposits and notify 'burn_subs'.
+    - Fetch & update in-memory cursor (last_ts, last_sig)
+    - For each event: record => if inserted => send
+    - Persist cursor AFTER sending
     """
     db = SubscriberDB(cfg.DATABASE_URL)
 
-    # Load state (used for visibility; not relied upon for ordering)
-    state = await db.get_state("burn")
-
-    events = await sources.get_new_burns(cfg, state)
+    state = await db.get_state("burn")  # may contain last_ts/last_sig (or be {})
+    events = await sources.get_new_burns(cfg, state, ignore_cursor=False)
 
     if not events:
-        log.info("burn job: no new events in window; last_checked_at=%s", state.get("last_checked_at"))
+        log.info("burn job: no new events; cursor unchanged (last_ts=%s last_sig=%s)",
+                 state.get("last_ts"), state.get("last_sig"))
         return
 
     subs = await db.get_subs("burn_subs")
     if not subs:
+        # advance cursor so we don't replay forever when no subs
         await db.save_state("burn", state)
-        log.info("burn job: %d event(s) but 0 subscribers; cursor saved", len(events))
+        log.info("burn job: %d event(s) but 0 subscribers; saved cursor last_sig=%s",
+                 len(events), state.get("last_sig"))
         return
 
-    log.info("burn job: %d event(s) in window, %d subscriber(s)", len(events), len(subs))
+    log.info("burn job: %d event(s), sending to %d subscriber(s)", len(events), len(subs))
     for ev in events:
-        # Insert & dedupe by signature
-        inserted = await db.record_burn(ev["signature"], ev["ts"], ev["amount"], ev.get("price_usd"))
-        if not inserted:
-            # Already recorded earlier; skip notifying to avoid duplicates
+        # Insert into DB; only send if it's a new row (prevents dup messages)
+        is_new = await db.record_burn(ev["signature"], ev["ts"], ev["amount"], ev.get("price_usd"))
+        if not is_new:
             continue
 
         totals = await db.sums_24_7_30()
@@ -67,13 +67,13 @@ async def run_burn_once(bot, cfg):
 
         for chat_id in subs:
             try:
-                await bot.send_message(chat_id, text, disable_web_page_preview=True, parse_mode="HTML")
+                await bot.send_message(chat_id, text, parse_mode="HTML", disable_web_page_preview=True)
             except Exception:
                 log.exception("send burn failed chat_id=%s", chat_id)
 
-    # Save updated state (for visibility)
+    # Persist cursor AFTER recording/sending
     await db.save_state("burn", state)
-    log.info("burn job: state saved (last_checked_at=%s)", state.get("last_checked_at"))
+    log.info("burn job: saved cursor last_ts=%s last_sig=%s", state.get("last_ts"), state.get("last_sig"))
 
 
 # --------- AIOHTTP ROUTES ----------
@@ -100,7 +100,7 @@ async def handle_cron_burn(request: web.Request) -> web.Response:
         return web.Response(status=500, text="error")
 
 
-# ---- Admin: reset cursor (fixes 'stuck' cursor) ----
+# ---- Admin: reset cursor (still useful if you ever want to rescan) ----
 async def handle_admin_reset_cursor(request: web.Request) -> web.Response:
     if not await _check_secret(request):
         return web.Response(status=403, text="forbidden")
@@ -127,34 +127,30 @@ async def handle_admin_replay(request: web.Request) -> web.Response:
         n = 1
 
     try:
-        temp_state = {}
-        events = await sources.get_new_burns(cfg, temp_state)
-        if not events:
-            return web.Response(text="no recent burns")
+        async with _RUN_LOCK:
+            # Fetch recent events ignoring persisted cursor
+            temp_state: dict = {}
+            events = await sources.get_new_burns(cfg, temp_state, ignore_cursor=True)
+            if not events:
+                return web.Response(text="no recent burns")
 
-        to_send = events[-n:]
-        db = SubscriberDB(cfg.DATABASE_URL)
-        subs = await db.get_subs("burn_subs")
+            to_send = events[-n:]  # newest N
+            db = SubscriberDB(cfg.DATABASE_URL)
+            subs = await db.get_subs("burn_subs")
 
-        sent = 0
-        for ev in to_send:
-            inserted = await db.record_burn(ev["signature"], ev["ts"], ev["amount"], ev.get("price_usd"))
-            if not inserted:
-                # Already in DB -> skip to avoid duplicate spam during backfill
-                continue
+            sent = 0
+            for ev in to_send:
+                # Record (idempotent) but ALWAYS send for manual replay
+                await db.record_burn(ev["signature"], ev["ts"], ev["amount"], ev.get("price_usd"))
+                totals = await db.sums_24_7_30()
+                text = sources.format_burn(ev, totals)
 
-            totals = await db.sums_24_7_30()
-            text = sources.format_burn(ev, totals)
-
-            for chat_id in subs:
-                try:
-                    await ptb.bot.send_message(chat_id, text, disable_web_page_preview=True, parse_mode="HTML")
-                except Exception:
-                    log.exception("send burn (replay) failed chat_id=%s", chat_id)
-            sent += 1
-
-        # (Optional) store a hint; not relied upon by fetch window logic
-        await db.save_state("burn", {"last_checked_at": temp_state.get("last_checked_at")})
+                for chat_id in subs:
+                    try:
+                        await ptb.bot.send_message(chat_id, text, parse_mode="HTML", disable_web_page_preview=True)
+                    except Exception:
+                        log.exception("send burn (replay) failed chat_id=%s", chat_id)
+                sent += 1
 
         return web.Response(text=f"ok: sent {sent} alert(s)")
     except Exception:
@@ -166,8 +162,10 @@ async def handle_telegram_webhook(request: web.Request) -> web.Response:
     cfg = request.app["cfg"]
     ptb: Application = request.app["ptb"]
 
+    # Verify Telegram secret header if configured
     secret_hdr = request.headers.get("X-Telegram-Bot-Api-Secret-Token")
     if getattr(cfg, "TELEGRAM_WEBHOOK_SECRET", "") and secret_hdr != cfg.TELEGRAM_WEBHOOK_SECRET:
+        log.warning("Webhook secret mismatch")
         return web.Response(status=403, text="forbidden")
 
     try:
