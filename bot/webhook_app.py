@@ -18,7 +18,7 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s:%(name
 log = logging.getLogger("webhook_app")
 logging.getLogger("httpx").setLevel(logging.WARNING)
 
-# prevent overlapping cron/admin runs
+# prevent overlapping admin runs
 _RUN_LOCK = asyncio.Lock()
 
 
@@ -32,51 +32,6 @@ def build_ptb_application(cfg) -> Application:
     return app
 
 
-# --------- BURN JOB (HTTP CRON TRIGGER USES THIS) ----------
-async def run_burn_once(bot, cfg):
-    """
-    Pull new deposits and notify 'burn_subs'.
-    - Fetch & update in-memory cursor (last_ts, last_sig)
-    - For each event: record => if inserted => send
-    - Persist cursor AFTER sending
-    """
-    db = SubscriberDB(cfg.DATABASE_URL)
-    state = await db.get_state("burn")  # may contain last_ts/last_sig (or be {})
-    events = await sources.get_new_burns(cfg, state, ignore_cursor=False)
-
-    if not events:
-        log.info("burn job: no new events; cursor unchanged (last_ts=%s last_sig=%s)",
-                 state.get("last_ts"), state.get("last_sig"))
-        return
-
-    subs = await db.get_subs("burn_subs")
-    if not subs:
-        # advance cursor so we don't replay forever when no subs
-        await db.save_state("burn", state)
-        log.info("burn job: %d event(s) but 0 subscribers; saved cursor last_sig=%s",
-                 len(events), state.get("last_sig"))
-        return
-
-    log.info("burn job: %d event(s), sending to %d subscriber(s)", len(events), len(subs))
-    for ev in events:
-        is_new = await db.record_burn(ev["signature"], ev["ts"], ev["amount"], ev.get("price_usd"))
-        if not is_new:
-            continue
-
-        totals = await db.sums_24_7_30()
-        text = sources.format_burn(ev, totals)
-
-        for chat_id in subs:
-            try:
-                await bot.send_message(chat_id, text, parse_mode="HTML", disable_web_page_preview=True)
-            except Exception:
-                log.exception("send burn failed chat_id=%s", chat_id)
-
-    # Persist cursor AFTER recording/sending
-    await db.save_state("burn", state)
-    log.info("burn job: saved cursor last_ts=%s last_sig=%s", state.get("last_ts"), state.get("last_sig"))
-
-
 # --------- AIOHTTP ROUTES ----------
 async def handle_healthz(_request: web.Request) -> web.Response:
     return web.Response(text="ok")
@@ -87,18 +42,6 @@ async def _check_secret(req: web.Request) -> bool:
     expected = (os.environ.get("CRON_SECRET") or getattr(cfg, "CRON_SECRET", "") or "").strip()
     received = (req.query.get("secret") or "").strip()
     return (not expected) or (received == expected)
-
-
-async def handle_cron_burn(request: web.Request) -> web.Response:
-    if not await _check_secret(request):
-        return web.Response(status=403, text="forbidden")
-    try:
-        async with _RUN_LOCK:
-            await run_burn_once(request.app["ptb"].bot, request.app["cfg"])
-        return web.Response(text="ok")
-    except Exception:
-        log.exception("cron burn failed")
-        return web.Response(status=500, text="error")
 
 
 # ---- Admin: reset cursor (still useful if you ever want to rescan) ----
@@ -159,7 +102,7 @@ async def handle_admin_replay(request: web.Request) -> web.Response:
         return web.Response(status=500, text="error")
 
 
-# ---- NEW: Helius Enhanced Webhook endpoint (push) ----
+# ---- Helius Enhanced Webhook endpoint (push) ----
 async def handle_helius_webhook(request: web.Request) -> web.Response:
     cfg = request.app["cfg"]
 
@@ -302,10 +245,9 @@ def build_web_app() -> web.Application:
 
     app.add_routes([
         web.get("/healthz", handle_healthz),
-        web.get("/cron/burn", handle_cron_burn),
         web.get("/admin/reset-burn-cursor", handle_admin_reset_cursor),
         web.get("/admin/replay", handle_admin_replay),
-        web.post("/helius/webhook", handle_helius_webhook),  # <-- webhook POST target
+        web.post("/helius/webhook", handle_helius_webhook),  # webhook POST target
         web.post(hook_path, handle_telegram_webhook),
     ])
     app.on_startup.append(on_startup)
