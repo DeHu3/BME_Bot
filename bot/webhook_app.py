@@ -106,11 +106,12 @@ async def handle_admin_replay(request: web.Request) -> web.Response:
 async def handle_helius_webhook(request: web.Request) -> web.Response:
     cfg = request.app["cfg"]
 
-    # Secret used either for HMAC validation OR simple header match.
-    # CHANGE: prefer environment variable first (live Render env is the source of truth)
-    secret = (os.environ.get("HELIUS_WEBHOOK_SECRET", "") or getattr(cfg, "HELIUS_WEBHOOK_SECRET", "") or "").strip()
-    # Safe observability (does not leak the secret value)
-    log.info("helius auth enabled=%s secret_len=%d", bool(secret), len(secret))
+    # Prefer LIVE env var first; fallback to cfg default.
+    secret = (
+        os.environ.get("HELIUS_WEBHOOK_SECRET", "")
+        or getattr(cfg, "HELIUS_WEBHOOK_SECRET", "")
+        or ""
+    ).strip()
 
     # Read raw body once (needed if verifying HMAC)
     try:
@@ -118,25 +119,44 @@ async def handle_helius_webhook(request: web.Request) -> web.Response:
     except Exception:
         return web.Response(status=400, text="bad request")
 
-    # Accept either:
-    #  1) X-Helius-Signature: HMAC_SHA256(secret, raw_body)  OR
-    #  2) X-Helius-Auth: <secret> (Helius "Authentication Header" passthrough)
+    # Normalize helper to avoid mismatches due to stray quotes/spaces.
+    def _norm(s: str | None) -> str:
+        return (s or "").strip().strip('"').strip("'")
+
     if secret:
-        sig_hdr = (request.headers.get("X-Helius-Signature") or "").strip()
-        auth_hdr = (request.headers.get("X-Helius-Auth") or "").strip()
+        secret = _norm(secret)
 
-        ok = False
-        if sig_hdr:
-            expected = hmac.new(secret.encode("utf-8"), raw, hashlib.sha256).hexdigest()
-            ok = hmac.compare_digest(sig_hdr, expected)
-        if not ok and auth_hdr:
-            ok = hmac.compare_digest(auth_hdr, secret)
+        # Accept either X-Helius-Auth: <secret> OR Authorization: Bearer <secret>
+        x_auth = request.headers.get("X-Helius-Auth")
+        authz  = request.headers.get("Authorization")
+        x_sig  = request.headers.get("X-Helius-Signature")
 
-        # More observability without revealing values
+        # Observability (does not leak values)
+        log.info("helius auth enabled=%s secret_len=%d", True, len(secret))
         log.info(
             "helius hdrs present: x-auth=%s x-sig=%s (lens %d/%d)",
-            bool(auth_hdr), bool(sig_hdr), len(auth_hdr or ""), len(sig_hdr or "")
+            bool(x_auth), bool(x_sig), len(x_auth or ""), len(x_sig or "")
         )
+
+        ok = False
+
+        # Plain shared-secret header
+        if _norm(x_auth) and hmac.compare_digest(_norm(x_auth), secret):
+            ok = True
+
+        # Authorization: Bearer <secret>
+        if not ok and authz:
+            val = _norm(authz)
+            if val.lower().startswith("bearer "):
+                token = _norm(val[7:])
+                if hmac.compare_digest(token, secret):
+                    ok = True
+
+        # HMAC signature of raw body
+        if not ok and x_sig:
+            expected = hmac.new(secret.encode("utf-8"), raw, hashlib.sha256).hexdigest()
+            if hmac.compare_digest(_norm(x_sig), expected):
+                ok = True
 
         if not ok:
             log.warning("Helius webhook auth failed")
