@@ -106,8 +106,16 @@ async def handle_admin_replay(request: web.Request) -> web.Response:
 async def handle_helius_webhook(request: web.Request) -> web.Response:
     cfg = request.app["cfg"]
 
-    # Secret used either for HMAC validation OR simple header match.
-    secret = (getattr(cfg, "HELIUS_WEBHOOK_SECRET", "") or os.environ.get("HELIUS_WEBHOOK_SECRET", "")).strip()
+    # Secret used either for HMAC validation OR header token validation.
+    # Keep original precedence (cfg first, then env) but normalize quotes/whitespace.
+    secret = (
+        getattr(cfg, "HELIUS_WEBHOOK_SECRET", "")
+        or os.environ.get("HELIUS_WEBHOOK_SECRET", "")
+        or ""
+    ).strip().strip('"').strip("'")
+
+    # Safe observability (does not leak the secret value)
+    log.info("helius auth enabled=%s secret_len=%d", bool(secret), len(secret))
 
     # Read raw body once (needed if verifying HMAC)
     try:
@@ -115,19 +123,47 @@ async def handle_helius_webhook(request: web.Request) -> web.Response:
     except Exception:
         return web.Response(status=400, text="bad request")
 
-    # Accept either:
-    #  1) X-Helius-Signature: HMAC_SHA256(secret, raw_body)  OR
-    #  2) X-Helius-Auth: <secret> (Helius "Authentication Header" passthrough)
+    # Accept any of the following if a secret is configured:
+    #   1) X-Helius-Signature: HMAC_SHA256(secret, raw_body)
+    #   2) X-Helius-Auth: <secret>
+    #   3) Authorization: Bearer <secret>
+    #   4) Authorization: <secret>
     if secret:
-        sig_hdr = (request.headers.get("X-Helius-Signature") or "").strip()
-        auth_hdr = (request.headers.get("X-Helius-Auth") or "").strip()
+        headers = request.headers
+
+        # HMAC path
+        sig_hdr = (headers.get("X-Helius-Signature") or "").strip().strip('"').strip("'")
+
+        # Passthrough header path
+        xauth_raw = headers.get("X-Helius-Auth") or ""
+        xauth = xauth_raw.strip().strip('"').strip("'")
+
+        # Authorization variants
+        authz_raw = headers.get("Authorization") or ""
+        authz_clean = authz_raw.strip().strip('"').strip("'")
+        bearer = ""
+        if authz_clean:
+            parts = authz_clean.split(None, 1)
+            if len(parts) == 2 and parts[0].lower() == "bearer":
+                bearer = parts[1].strip().strip('"').strip("'")
+            else:
+                bearer = authz_clean  # plain token
 
         ok = False
         if sig_hdr:
             expected = hmac.new(secret.encode("utf-8"), raw, hashlib.sha256).hexdigest()
-            ok = hmac.compare_digest(sig_hdr, expected)
-        if not ok and auth_hdr:
-            ok = hmac.compare_digest(auth_hdr, secret)
+            ok = hmac.compare_digest(sig_hdr.lower(), expected.lower())
+        if not ok and xauth:
+            ok = hmac.compare_digest(xauth, secret)
+        if not ok and bearer:
+            ok = hmac.compare_digest(bearer, secret)
+
+        # Non-sensitive diagnostics
+        log.info(
+            "helius hdrs present: authorization=%s x-auth=%s x-sig=%s (lens %d/%d/%d)",
+            bool(authz_raw), bool(xauth_raw), bool(sig_hdr),
+            len(authz_raw), len(xauth_raw), len(sig_hdr),
+        )
 
         if not ok:
             log.warning("Helius webhook auth failed")
