@@ -107,7 +107,10 @@ async def handle_helius_webhook(request: web.Request) -> web.Response:
     cfg = request.app["cfg"]
 
     # Secret used either for HMAC validation OR simple header match.
-    secret = (getattr(cfg, "HELIUS_WEBHOOK_SECRET", "") or os.environ.get("HELIUS_WEBHOOK_SECRET", "")).strip()
+    # CHANGE: prefer environment variable first (live Render env is the source of truth)
+    secret = (os.environ.get("HELIUS_WEBHOOK_SECRET", "") or getattr(cfg, "HELIUS_WEBHOOK_SECRET", "") or "").strip()
+    # Safe observability (does not leak the secret value)
+    log.info("helius auth enabled=%s secret_len=%d", bool(secret), len(secret))
 
     # Read raw body once (needed if verifying HMAC)
     try:
@@ -128,6 +131,12 @@ async def handle_helius_webhook(request: web.Request) -> web.Response:
             ok = hmac.compare_digest(sig_hdr, expected)
         if not ok and auth_hdr:
             ok = hmac.compare_digest(auth_hdr, secret)
+
+        # More observability without revealing values
+        log.info(
+            "helius hdrs present: x-auth=%s x-sig=%s (lens %d/%d)",
+            bool(auth_hdr), bool(sig_hdr), len(auth_hdr or ""), len(sig_hdr or "")
+        )
 
         if not ok:
             log.warning("Helius webhook auth failed")
