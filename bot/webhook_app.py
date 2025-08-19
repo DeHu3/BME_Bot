@@ -117,6 +117,25 @@ async def handle_helius_webhook(request: web.Request) -> web.Response:
     # Safe observability (does not leak the secret value)
     log.info("helius auth enabled=%s secret_len=%d", bool(secret), len(secret))
 
+    # Helper to normalize any auth header value into a bare token
+    def _extract_token(val: str) -> str:
+        if not val:
+            return ""
+        s = val.strip().strip('"').strip("'")
+        # Loop to handle accidental double prefixes like "Authorization: Authorization: <secret>"
+        while True:
+            low = s.lower()
+            if low.startswith("bearer "):
+                s = s[7:].strip().strip('"').strip("'")
+                break
+            if ":" in s:
+                name, rest = s.split(":", 1)
+                if name.strip().lower() in ("authorization", "x-helius-auth", "x_helius_auth"):
+                    s = rest.strip().strip('"').strip("'")
+                    continue  # keep stripping if repeated
+            break
+        return s
+
     # Read raw body once (needed if verifying HMAC)
     try:
         raw = await request.read()
@@ -128,35 +147,28 @@ async def handle_helius_webhook(request: web.Request) -> web.Response:
     #   2) X-Helius-Auth: <secret>
     #   3) Authorization: Bearer <secret>
     #   4) Authorization: <secret>
+    #   5) (tolerated misconfig) Authorization: Authorization: <secret>
     if secret:
         headers = request.headers
 
         # HMAC path
         sig_hdr = (headers.get("X-Helius-Signature") or "").strip().strip('"').strip("'")
 
-        # Passthrough header path
+        # Shared-secret header variants
         xauth_raw = headers.get("X-Helius-Auth") or ""
-        xauth = xauth_raw.strip().strip('"').strip("'")
-
-        # Authorization variants
         authz_raw = headers.get("Authorization") or ""
-        authz_clean = authz_raw.strip().strip('"').strip("'")
-        bearer = ""
-        if authz_clean:
-            parts = authz_clean.split(None, 1)
-            if len(parts) == 2 and parts[0].lower() == "bearer":
-                bearer = parts[1].strip().strip('"').strip("'")
-            else:
-                bearer = authz_clean  # plain token
+
+        xauth_token = _extract_token(xauth_raw)
+        authz_token = _extract_token(authz_raw)
 
         ok = False
         if sig_hdr:
             expected = hmac.new(secret.encode("utf-8"), raw, hashlib.sha256).hexdigest()
             ok = hmac.compare_digest(sig_hdr.lower(), expected.lower())
-        if not ok and xauth:
-            ok = hmac.compare_digest(xauth, secret)
-        if not ok and bearer:
-            ok = hmac.compare_digest(bearer, secret)
+        if not ok and xauth_token:
+            ok = hmac.compare_digest(xauth_token, secret)
+        if not ok and authz_token:
+            ok = hmac.compare_digest(authz_token, secret)
 
         # Non-sensitive diagnostics
         log.info(
