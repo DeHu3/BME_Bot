@@ -3,14 +3,24 @@ from __future__ import annotations
 
 import asyncio
 import random
+import os
+import time
 from typing import List, Dict, Any, Tuple, Optional
 import httpx
 
 
 # ------------------------
-# Price (current price; simple & robust)
+# Price helpers (DexScreener first with cache; fallback to CoinGecko)
 # ------------------------
-async def _get_price_usd(coingecko_id: str = "render-token") -> float:
+
+# Very small in-memory cache to avoid hammering price APIs
+_PRICE_CACHE: Dict[str, float] = {"usd": 0.0}
+_PRICE_CACHE_TS: float = 0.0
+
+async def _get_price_usd_from_coingecko(coingecko_id: str = "render-token") -> float:
+    """
+    CoinGecko fallback. (Kept separate so existing behavior is preserved if Dex fails.)
+    """
     url = "https://api.coingecko.com/api/v3/simple/price"
     params = {"ids": coingecko_id, "vs_currencies": "usd"}
     try:
@@ -21,6 +31,122 @@ async def _get_price_usd(coingecko_id: str = "render-token") -> float:
             return float(data.get(coingecko_id, {}).get("usd", 0)) or 0.0
     except Exception:
         return 0.0
+
+
+def _dex_pick_best_price(pairs: Any) -> float:
+    """
+    Given DexScreener pairs shape, pick the price from the pair with the highest liquidity.usd.
+    Accepts either a list under 'pairs' or a single 'pair' dict.
+    """
+    # Normalize to list
+    arr: List[Dict[str, Any]] = []
+    if isinstance(pairs, list):
+        arr = [p for p in pairs if isinstance(p, dict)]
+    elif isinstance(pairs, dict):
+        arr = [pairs]  # single
+    else:
+        return 0.0
+
+    best_price = 0.0
+    best_liq = -1.0
+    for p in arr:
+        # priceUsd often a string
+        try:
+            price = float(p.get("priceUsd") or 0)
+        except Exception:
+            continue
+        liq = 0.0
+        liq_obj = p.get("liquidity") or {}
+        try:
+            liq = float(liq_obj.get("usd", 0) or 0)
+        except Exception:
+            liq = 0.0
+        if price > 0 and liq >= best_liq:
+            best_liq = liq
+            best_price = price
+    return best_price or 0.0
+
+
+async def _get_price_usd_dexscreener_by_pair(pair_id: str) -> float:
+    """
+    DexScreener by explicit pair id: https://api.dexscreener.com/latest/dex/pairs/solana/{pair}
+    """
+    pair_id = (pair_id or "").strip()
+    if not pair_id:
+        return 0.0
+    url = f"https://api.dexscreener.com/latest/dex/pairs/solana/{pair_id}"
+    try:
+        async with httpx.AsyncClient(timeout=10) as client:
+            r = await client.get(url)
+            r.raise_for_status()
+            data = r.json()
+        pairs = data.get("pairs")
+        if not pairs and isinstance(data.get("pair"), dict):
+            pairs = [data["pair"]]
+        return _dex_pick_best_price(pairs)
+    except Exception:
+        return 0.0
+
+
+async def _get_price_usd_dexscreener_by_token(mint: str) -> float:
+    """
+    DexScreener by token mint: https://api.dexscreener.com/latest/dex/tokens/{mint}
+    We will pick the most liquid pair for robustness.
+    """
+    mint = (mint or "").strip()
+    if not mint:
+        return 0.0
+    url = f"https://api.dexscreener.com/latest/dex/tokens/{mint}"
+    try:
+        async with httpx.AsyncClient(timeout=10) as client:
+            r = await client.get(url)
+            r.raise_for_status()
+            data = r.json()
+        pairs = data.get("pairs") or []
+        return _dex_pick_best_price(pairs)
+    except Exception:
+        return 0.0
+
+
+async def resolve_price_usd(cfg) -> float:
+    """
+    Primary price resolver with tiny cache:
+      1) DexScreener by pair (DEXSCREENER_PAIR) if provided
+      2) DexScreener by token mint (RENDER_MINT) if provided
+      3) CoinGecko (COINGECKO_ID) as fallback
+      4) else 0.0 (alerts still send)
+    """
+    global _PRICE_CACHE_TS
+
+    # TTL: allow override via cfg.PRICE_CACHE_TTL; default 120s
+    try:
+        ttl = float(getattr(cfg, "PRICE_CACHE_TTL", 120))
+    except Exception:
+        ttl = 120.0
+
+    now = time.time()
+    cached = _PRICE_CACHE.get("usd", 0.0)
+    if cached > 0 and (now - _PRICE_CACHE_TS) < ttl:
+        return cached
+
+    pair = (getattr(cfg, "DEXSCREENER_PAIR", "") or os.environ.get("DEXSCREENER_PAIR", "") or "").strip()
+    mint = (getattr(cfg, "RENDER_MINT", "") or os.environ.get("RENDER_MINT", "") or "").strip()
+
+    price = 0.0
+    if pair:
+        price = await _get_price_usd_dexscreener_by_pair(pair)
+    if price <= 0 and mint:
+        price = await _get_price_usd_dexscreener_by_token(mint)
+    if price <= 0:
+        gecko_id = getattr(cfg, "COINGECKO_ID", "render-token")
+        price = await _get_price_usd_from_coingecko(gecko_id)
+
+    # Cache only positive prices so a transient 0 doesn't stick
+    if price > 0:
+        _PRICE_CACHE["usd"] = price
+        _PRICE_CACHE_TS = now
+
+    return price
 
 
 # ------------------------
@@ -178,7 +304,8 @@ async def get_new_burns(
     newest_page_sig: Optional[str] = None
     newest_page_ts: int = 0
 
-    price_usd = await _get_price_usd(getattr(cfg, "COINGECKO_ID", "render-token"))
+    # *** CHANGED: use resolver (DexScreener -> CoinGecko) with cache
+    price_usd = await resolve_price_usd(cfg)
 
     events_by_sig: Dict[str, Dict[str, Any]] = {}
     before: Optional[str] = None
@@ -282,7 +409,9 @@ async def parse_helius_webhook(cfg, payload: Any) -> List[Dict[str, Any]]:
     else:
         txs = []
 
-    price_usd = await _get_price_usd(getattr(cfg, "COINGECKO_ID", "render-token"))
+    # *** CHANGED: use resolver (DexScreener -> CoinGecko) with cache
+    price_usd = await resolve_price_usd(cfg)
+
     by_sig: Dict[str, Dict[str, Any]] = {}
 
     for tx in txs:
