@@ -210,61 +210,34 @@ def _extract_amount(tr: Dict[str, Any]) -> float:
         return 0.0
 
 
-def _extract_mint(tr: Dict[str, Any]) -> str:
-    """
-    Try to extract the SPL mint for the transfer.
-    """
-    m = tr.get("mint") or tr.get("tokenMint")
-    if isinstance(m, str) and m.strip():
-        return m.strip()
-
-    # Look inside balance objects for 'mint'
-    for key in ("postTokenBalance", "postTokenBalances", "tokenBalances"):
-        pb = tr.get(key)
-        if isinstance(pb, dict):
-            mv = pb.get("mint")
-            if isinstance(mv, str) and mv.strip():
-                return mv.strip()
-        elif isinstance(pb, list):
-            for e in pb:
-                if isinstance(e, dict):
-                    mv = e.get("mint")
-                    if isinstance(mv, str) and mv.strip():
-                        return mv.strip()
-    return ""
-
-
 def _candidate_dest_accounts(tr: Dict[str, Any]) -> List[str]:
-    """
-    Collect likely destination *token-account* fields across Helius variants.
-    (Intentionally excludes any 'owner'/'user' fields to avoid false positives.)
-    """
+    """Collect likely destination token-account fields across Helius variants."""
     cands: List[str] = []
-
     for key in (
-        "destinationTokenAccount",
+        "toUserAccount",
         "toTokenAccount",
-        "tokenAccount",
-        "account",
-        # 'to'/'destination' can sometimes be token accounts in Helius payloads
         "to",
         "destination",
+        "destinationTokenAccount",
+        "account",
+        "destinationUserAccount",
     ):
         v = tr.get(key)
         if isinstance(v, str) and v.strip():
             cands.append(v.strip())
 
-    # Some shapes carry balances with embedded *account* info; do NOT include 'owner'
-    for bal_key in ("postTokenBalance", "postTokenBalances"):
-        pb = tr.get(bal_key)
-        if isinstance(pb, dict):
-            vv = pb.get("account")
+    # Some shapes carry balances with embedded account info
+    pb = tr.get("postTokenBalance") or tr.get("postTokenBalances")
+    if isinstance(pb, dict):
+        for k in ("account", "owner"):
+            vv = pb.get(k)
             if isinstance(vv, str) and vv.strip():
                 cands.append(vv.strip())
-        elif isinstance(pb, list):
-            for e in pb:
-                if isinstance(e, dict):
-                    vv = e.get("account")
+    elif isinstance(pb, list):
+        for e in pb:
+            if isinstance(e, dict):
+                for k in ("account", "owner"):
+                    vv = e.get(k)
                     if isinstance(vv, str) and vv.strip():
                         cands.append(vv.strip())
 
@@ -278,31 +251,7 @@ def _candidate_dest_accounts(tr: Dict[str, Any]) -> List[str]:
     return out
 
 
-def _is_rndr_burn_deposit(tr: Dict[str, Any], burn_vault: str, rndr_mint: str) -> bool:
-    """
-    True if transfer is RNDR mint *to* the exact burn vault token account (ATA).
-    If rndr_mint is empty, falls back to destination-only check (legacy behavior).
-    """
-    burn_vault = (burn_vault or "").strip()
-    if not burn_vault:
-        return False
-
-    dests = _candidate_dest_accounts(tr)
-    if burn_vault not in dests:
-        return False
-
-    if rndr_mint:
-        m = _extract_mint(tr)
-        return m == rndr_mint.strip()
-
-    # Fallback (shouldn't be used if env is correct, but keeps bot from breaking)
-    return True
-
-
 def _is_to_burn_vault(tr: Dict[str, Any], burn_vault: str) -> bool:
-    """
-    Legacy predicate (kept for compatibility where needed).
-    """
     burn_vault = burn_vault.strip()
     if not burn_vault:
         return False
@@ -355,11 +304,8 @@ async def get_new_burns(
     newest_page_sig: Optional[str] = None
     newest_page_ts: int = 0
 
-    # Price resolver (DexScreener -> CoinGecko) with cache
+    # *** CHANGED: use resolver (DexScreener -> CoinGecko) with cache
     price_usd = await resolve_price_usd(cfg)
-
-    # RNDR mint (if set, we enforce it; else we fallback to legacy dest-only)
-    rndr_mint = (getattr(cfg, "RENDER_MINT", "") or os.environ.get("RENDER_MINT", "") or "").strip()
 
     events_by_sig: Dict[str, Dict[str, Any]] = {}
     before: Optional[str] = None
@@ -405,7 +351,7 @@ async def get_new_burns(
 
             total_amount = 0.0
             for tr in transfers:
-                if _is_rndr_burn_deposit(tr, burn_vault, rndr_mint):
+                if _is_to_burn_vault(tr, burn_vault):
                     amt = _extract_amount(tr)
                     if amt > 0:
                         total_amount += amt
@@ -437,7 +383,7 @@ async def get_new_burns(
 
 
 # ------------------------
-# Parse Helius Enhanced Webhook payload (push)
+# NEW: Parse Helius Enhanced Webhook payload (push)
 # ------------------------
 async def parse_helius_webhook(cfg, payload: Any) -> List[Dict[str, Any]]:
     """
@@ -463,10 +409,9 @@ async def parse_helius_webhook(cfg, payload: Any) -> List[Dict[str, Any]]:
     else:
         txs = []
 
-    # Price resolver (DexScreener -> CoinGecko) with cache
+    # *** CHANGED: use resolver (DexScreener -> CoinGecko) with cache
     price_usd = await resolve_price_usd(cfg)
 
-    rndr_mint = (getattr(cfg, "RENDER_MINT", "") or os.environ.get("RENDER_MINT", "") or "").strip()
     by_sig: Dict[str, Dict[str, Any]] = {}
 
     for tx in txs:
@@ -482,7 +427,7 @@ async def parse_helius_webhook(cfg, payload: Any) -> List[Dict[str, Any]]:
 
         total = 0.0
         for tr in transfers:
-            if _is_rndr_burn_deposit(tr, burn_vault, rndr_mint):
+            if _is_to_burn_vault(tr, burn_vault):
                 amt = _extract_amount(tr)
                 if amt > 0:
                     total += amt
