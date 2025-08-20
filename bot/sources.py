@@ -251,6 +251,49 @@ def _candidate_dest_accounts(tr: Dict[str, Any]) -> List[str]:
     return out
 
 
+def _mint_candidates(tr: Dict[str, Any]) -> List[str]:
+    """Collect likely mint fields in a transfer across Helius variants."""
+    cands: List[str] = []
+    for key in ("mint", "tokenMint", "mintAddress", "tokenAddress", "mintAccount"):
+        v = tr.get(key)
+        if isinstance(v, str) and v.strip():
+            cands.append(v.strip())
+
+    # Look into pre/post token balances if present
+    for key in ("preTokenBalance", "preTokenBalances", "postTokenBalance", "postTokenBalances"):
+        pb = tr.get(key)
+        if isinstance(pb, dict):
+            m = pb.get("mint")
+            if isinstance(m, str) and m.strip():
+                cands.append(m.strip())
+        elif isinstance(pb, list):
+            for e in pb:
+                if isinstance(e, dict):
+                    m = e.get("mint")
+                    if isinstance(m, str) and m.strip():
+                        cands.append(m.strip())
+
+    # Dedup
+    seen = set()
+    out = []
+    for m in cands:
+        if m not in seen:
+            out.append(m)
+            seen.add(m)
+    return out
+
+
+def _is_rndr_mint(tr: Dict[str, Any], rndr_mint: str) -> bool:
+    """Return True iff the transfer's mint matches RNDR mint."""
+    rndr_mint = (rndr_mint or "").strip()
+    if not rndr_mint:
+        return False
+    for m in _mint_candidates(tr):
+        if m == rndr_mint:
+            return True
+    return False
+
+
 def _is_to_burn_vault(tr: Dict[str, Any], burn_vault: str) -> bool:
     burn_vault = burn_vault.strip()
     if not burn_vault:
@@ -293,6 +336,9 @@ async def get_new_burns(
     if not burn_vault:
         return []
 
+    # RNDR mint for filtering (gracefully skip check if missing)
+    rndr_mint = (getattr(cfg, "RENDER_MINT", "") or os.environ.get("RENDER_MINT", "") or "").strip()
+
     base = f"https://api.helius.xyz/v0/addresses/{burn_vault}/transactions"
     # Use both query param and header to be robust across gateways
     common_params = {"limit": limit, "api-key": api_key}
@@ -304,7 +350,7 @@ async def get_new_burns(
     newest_page_sig: Optional[str] = None
     newest_page_ts: int = 0
 
-    # *** CHANGED: use resolver (DexScreener -> CoinGecko) with cache
+    # Use resolver (DexScreener -> CoinGecko) with cache
     price_usd = await resolve_price_usd(cfg)
 
     events_by_sig: Dict[str, Dict[str, Any]] = {}
@@ -351,7 +397,8 @@ async def get_new_burns(
 
             total_amount = 0.0
             for tr in transfers:
-                if _is_to_burn_vault(tr, burn_vault):
+                mint_ok = True if not rndr_mint else _is_rndr_mint(tr, rndr_mint)
+                if _is_to_burn_vault(tr, burn_vault) and mint_ok:
                     amt = _extract_amount(tr)
                     if amt > 0:
                         total_amount += amt
@@ -383,17 +430,19 @@ async def get_new_burns(
 
 
 # ------------------------
-# NEW: Parse Helius Enhanced Webhook payload (push)
+# Parse Helius Enhanced Webhook payload (push)
 # ------------------------
 async def parse_helius_webhook(cfg, payload: Any) -> List[Dict[str, Any]]:
     """
     Parse Helius Enhanced Webhook payload and return burn events in the
     same shape as get_new_burns(): {'signature','ts','amount','price_usd'}.
-    We detect deposits into the configured burn vault ATA.
+    We detect deposits into the configured burn vault ATA and require RNDR mint.
     """
     burn_vault = (getattr(cfg, "BURN_VAULT_ADDRESS", "") or getattr(cfg, "RENDER_BURN_ADDRESS", "") or "").strip()
     if not burn_vault:
         return []
+
+    rndr_mint = (getattr(cfg, "RENDER_MINT", "") or os.environ.get("RENDER_MINT", "") or "").strip()
 
     # Helius may wrap transactions under different keys
     if isinstance(payload, list):
@@ -409,7 +458,7 @@ async def parse_helius_webhook(cfg, payload: Any) -> List[Dict[str, Any]]:
     else:
         txs = []
 
-    # *** CHANGED: use resolver (DexScreener -> CoinGecko) with cache
+    # Use resolver (DexScreener -> CoinGecko) with cache
     price_usd = await resolve_price_usd(cfg)
 
     by_sig: Dict[str, Dict[str, Any]] = {}
@@ -427,7 +476,8 @@ async def parse_helius_webhook(cfg, payload: Any) -> List[Dict[str, Any]]:
 
         total = 0.0
         for tr in transfers:
-            if _is_to_burn_vault(tr, burn_vault):
+            mint_ok = True if not rndr_mint else _is_rndr_mint(tr, rndr_mint)
+            if _is_to_burn_vault(tr, burn_vault) and mint_ok:
                 amt = _extract_amount(tr)
                 if amt > 0:
                     total += amt
